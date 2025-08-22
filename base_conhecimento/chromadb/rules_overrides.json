@@ -1,0 +1,30 @@
+{
+  "PR::SITEPD PR - SIND DOS TRAB EM EMPR PRIVADAS DE PROC DE DADOS DE CURITIBA E REGIAO METROPOLITANA": {
+    "vr_valor": "R$ 28,00",
+    "va_valor": null,
+    "dias": 22,
+    "notas": null,
+    "fonte": "override_manual"
+  },
+  "RS::SINDPPD RS - SINDICATO DOS TRAB. EM PROC. DE DADOS RIO GRANDE DO SUL": {
+    "vr_valor": "R$ 35,00",
+    "va_valor": null,
+    "dias": 21,
+    "notas": null,
+    "fonte": "override_manual"
+  },
+  "SP::SINDPD SP - SIND.TRAB.EM PROC DADOS E EMPR.EMPRESAS PROC DADOS ESTADO DE SP.": {
+    "vr_valor": "R$ 30,00",
+    "va_valor": null,
+    "dias": 22,
+    "notas": "sem dados no CCT",
+    "fonte": "override_manual"
+  },
+  "RJ::SINDPD RJ - SINDICATO PROFISSIONAIS DE PROC DADOS DO RIO DE JANEIRO": {
+    "vr_valor": "R$ 33,74",
+    "va_valor": null,
+    "dias": 21,
+    "notas": null,
+    "fonte": "override_manual"
+  }
+}

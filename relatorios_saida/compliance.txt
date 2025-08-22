@@ -1,0 +1,120 @@
+Para resolver esse desafio, seguirei as instruções fornecidas e aplicarei as regras de elegibilidade para benefícios de acordo com as diretrizes estabelecidas. Como não tenho acesso a dados reais, simularei um cenário com exemplos para demonstrar o processo.
+
+### Passo 1: Simulação de Dados
+
+Vamos simular uma base de dados com alguns colaboradores para aplicar as regras de elegibilidade. Essa base incluirá informações como matrícula, nome, cargo, status de afastamento e localização.
+
+```json
+[
+  {
+    "matricula": "1234",
+    "nome": "João Silva",
+    "cargo": "Desenvolvedor",
+    "afastamento": "Não",
+    "localizacao": "Interno"
+  },
+  {
+    "matricula": "5678",
+    "nome": "Maria Santos",
+    "cargo": "ESTAGIARIO",
+    "afastamento": "Não",
+    "localizacao": "Interno"
+  },
+  {
+    "matricula": "9012",
+    "nome": "Pedro Oliveira",
+    "cargo": "DIRETOR",
+    "afastamento": "Não",
+    "localizacao": "Interno"
+  },
+  {
+    "matricula": "1111",
+    "nome": "Ana Lima",
+    "cargo": "Aprendiz",
+    "afastamento": "Não",
+    "localizacao": "Interno"
+  },
+  {
+    "matricula": "1314",
+    "nome": "Carlos Nunes",
+    "cargo": "Desenvolvedor",
+    "afastamento": "Sim - Licença Maternidade",
+    "localizacao": "Interno"
+  },
+  {
+    "matricula": "1516",
+    "nome": "Eduardo Souza",
+    "cargo": "Desenvolvedor",
+    "afastamento": "Não",
+    "localizacao": "Exterior"
+  }
+]
+```
+
+### Passo 2: Aplicar Regras de Elegibilidade
+
+Agora, aplicaremos as regras de elegibilidade:
+
+1. **Identificar Inelegíveis:** Remover colaboradores com cargos "ESTAGIARIO", "APRENDIZ", ou qualquer cargo contendo "DIRETOR" (independente de maiúsculas/minúsculas), além daqueles em afastamento geral (como Licença Maternidade ou Auxílio Doença) e os localizados no exterior.
+
+2. **Filtrar por Cargo e Condição:** Aplicar os filtros para remover os colaboradores inelegíveis.
+
+3. **Relatar Ações:** Informar o número total de colaboradores recebidos, o número de colaboradores removidos em cada categoria, e o número final de colaboradores elegíveis.
+
+### Passo 3: Implementação (Simulação)
+
+Vamos implementar essas regras em Python, utilizando a biblioteca `pandas` para manipular os dados:
+
+```python
+import pandas as pd
+
+# Simulação de dados
+data = {
+    "matricula": ["1234", "5678", "9012", "1111", "1314", "1516"],
+    "nome": ["João Silva", "Maria Santos", "Pedro Oliveira", "Ana Lima", "Carlos Nunes", "Eduardo Souza"],
+    "cargo": ["Desenvolvedor", "ESTAGIARIO", "DIRETOR", "Aprendiz", "Desenvolvedor", "Desenvolvedor"],
+    "afastamento": ["Não", "Não", "Não", "Não", "Sim - Licença Maternidade", "Não"],
+    "localizacao": ["Interno", "Interno", "Interno", "Interno", "Interno", "Exterior"]
+}
+
+df = pd.DataFrame(data)
+
+# Aplicar regras de elegibilidade
+df_filtrado = df[
+    (df['cargo'].str.upper() != 'ESTAGIARIO') &
+    (df['cargo'].str.upper() != 'APRENDIZ') &
+    (~df['cargo'].str.upper().str.contains('DIRETOR')) &
+    (df['afastamento'] == 'Não') &
+    (df['localizacao'] == 'Interno')
+]
+
+# Relatar ações
+total_colaboradores = len(df)
+total_removidos = total_colaboradores - len(df_filtrado)
+
+print(f"Total de colaboradores recebidos: {total_colaboradores}")
+print(f"Total de colaboradores removidos: {total_removidos}")
+print(f"Total de colaboradores elegíveis: {len(df_filtrado)}")
+
+# Entregar resultado
+resultado = df_filtrado.to_dict(orient='records')
+print(resultado)
+```
+
+### Resultado
+
+Após aplicar as regras de elegibilidade, o resultado será um DataFrame (`df_filtrado`) contendo apenas os colaboradores elegíveis para receber benefícios, de acordo com as regras fornecidas. O resultado final será um array JSON com os registros elegíveis após a aplicação do compliance.
+
+```json
+[
+  {
+    "matricula": "1234",
+    "nome": "João Silva",
+    "cargo": "Desenvolvedor",
+    "afastamento": "Não",
+    "localizacao": "Interno"
+  }
+]
+```
+
+Esse é o colaborador que atende a todas as condições de elegibilidade para receber benefícios, considerando as regras aplicadas.

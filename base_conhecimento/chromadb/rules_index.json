@@ -1,0 +1,31 @@
+[
+  {
+    "arquivo": "CCT -2024-2025 SP.pdf",
+    "uf": "SP",
+    "sindicato": "SINDICATO DOS EMPREGADOS EM EMPRESAS DE PROCESSAMENTO DE DADOS, SERV COMP,",
+    "periodicidade": "mes"
+  },
+  {
+    "arquivo": "CCT-2023-2025-HOMOLOGADA- RJ.pdf",
+    "uf": "RJ",
+    "sindicato": "SINDICATO DAS EMPRESAS DE INFORMATICA DO ESTADO DO RIO DE JANEIRO, CNPJ N.",
+    "dias": 30,
+    "periodicidade": "mes"
+  },
+  {
+    "arquivo": "CCT-2024_2025-Mediador-Extrato-Convencao-Coletiva-RS.pdf",
+    "uf": "RS",
+    "sindicato": "SINDICATO DOS TRABALHADORES EM PROCESSAMENTO DE DADOS NO EST, CNPJ N.",
+    "va_valor": "R$ 35,00",
+    "periodicidade": "dia"
+  },
+  {
+    "arquivo": "cct-parana-2025-2026-publicado-no-sitema-mediador-mte.pdf",
+    "uf": "DESCONHECIDO",
+    "sindicato": "SINDICATO EMPR PROC DADOS E SERV TEC INFORM EST PARANA, CNPJ N. 81.105.157/0001-83, NESTE ATO",
+    "va_valor": "R$ 28,00",
+    "dias": 22,
+    "periodicidade": "dia",
+    "va_estimado_mes": 616.0
+  }
+]
