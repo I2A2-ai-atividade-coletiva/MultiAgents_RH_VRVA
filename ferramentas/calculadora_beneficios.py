@@ -5,9 +5,39 @@ from langchain.tools import tool
 import pandas as pd
 import re
 import json
+import unicodedata
+import os
+import numpy as np
+from pathlib import Path
 from utils.calendario import dias_uteis_periodo
 from utils.regras_resolver import resolve_cct_rules
 
+# Base paths
+BASE_DIR = Path(__file__).resolve().parent.parent
+DADOS_DIR = BASE_DIR / "dados_entrada"
+
+# UF helpers
+UF_MAP = {
+    "AC": "Acre", "AL": "Alagoas", "AP": "Amapa", "AM": "Amazonas", "BA": "Bahia",
+    "CE": "Ceara", "DF": "Distrito Federal", "ES": "Espirito Santo", "GO": "Goias",
+    "MA": "Maranhao", "MT": "Mato Grosso", "MS": "Mato Grosso do Sul", "MG": "Minas Gerais",
+    "PA": "Para", "PB": "Paraiba", "PR": "Parana", "PE": "Pernambuco", "PI": "Piaui",
+    "RJ": "Rio de Janeiro", "RN": "Rio Grande do Norte", "RS": "Rio Grande do Sul", "RO": "Rondonia",
+    "RR": "Roraima", "SC": "Santa Catarina", "SP": "Sao Paulo", "SE": "Sergipe", "TO": "Tocantins"
+}
+UF_SET = set(UF_MAP.keys())
+
+def _norm_str(s: str) -> str:
+    return unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode("ascii")
+
+def _extract_uf_from_sindicato(s: str) -> Optional[str]:
+    if not isinstance(s, str):
+        return None
+    toks = re.findall(r"\b([A-Z]{2})\b", _norm_str(s))
+    for t in toks:
+        if t in UF_SET:
+            return t
+    return None
 
 def _daterange(start: date, end: date):
     curr = start
@@ -15,6 +45,89 @@ def _daterange(start: date, end: date):
         yield curr
         curr = curr + timedelta(days=1)
 
+def _parse_mes_ref(mes_referencia: str) -> Tuple[date, date]:
+    """
+    Converte 'YYYY-MM' em (data_inicial, data_final) do mês.
+    """
+    y, m = map(int, mes_referencia.split("-"))
+    ini = date(y, m, 1)
+    if m == 12:
+        fim = date(y + 1, 1, 1) - timedelta(days=1)
+    else:
+        fim = date(y, m + 1, 1) - timedelta(days=1)
+    return ini, fim
+
+def _should_exclude(row: pd.Series) -> bool:
+    """
+    Heurística para excluir colaboradores que não recebem VR:
+    - Diretores, estagiários, aprendizes
+    - Exterior
+    - Afastados (quando houver indicação)
+    """
+    txt_join = " ".join([str(v) for v in row.to_dict().values() if pd.notna(v)]).lower()
+    # padrões comuns em possíveis colunas de cargo/categoria/observações
+    if re.search(r"diretor|diretoria", txt_join):
+        return True
+    if re.search(r"estagi[aá]rio|estagio", txt_join):
+        return True
+    if re.search(r"aprendiz", txt_join):
+        return True
+    if re.search(r"exterior|internacional", txt_join):
+        return True
+    # indícios de afastamento
+    for c in row.index:
+        lc = c.lower()
+        if "afast" in lc:
+            val = row.get(c)
+            if isinstance(val, (int, float)):
+                if not pd.isna(val) and float(val) != 0:
+                    return True
+            else:
+                sval = str(val).strip().lower()
+                if sval and sval not in {"nan", "", "0", "nao", "não", "false", "no"}:
+                    return True
+    return False
+
+def _subtrai_periodos_uteis(inicio: date, fim: date, uf: Optional[str], municipio: Optional[str], periodos: List[Tuple[date, date]]) -> int:
+    """
+    Calcula dias úteis no intervalo [inicio, fim] subtraindo períodos fornecidos.
+    Usa `dias_uteis_periodo` quando possível (com UF/município), com fallback Mon-Fri.
+    """
+    def _uteis(a: date, b: date) -> int:
+        if a > b:
+            return 0
+        try:
+            return int(dias_uteis_periodo(a, b, uf=uf, municipio=municipio))
+        except Exception:
+            dias = 0
+            for d in _daterange(a, b):
+                if d.weekday() < 5:
+                    dias += 1
+            return dias
+
+    total = _uteis(inicio, fim)
+    for (s, e) in periodos:
+        si = max(inicio, s)
+        ef = min(fim, e)
+        if ef >= si:
+            total -= _uteis(si, ef)
+    return max(0, total)
+
+@tool("calcular_rateio_80_20")
+def calcular_rateio_80_20(df_json: str) -> str:
+    """
+    Recebe um DataFrame em JSON (orient=records) contendo a coluna 'TOTAL'.
+    Devolve o mesmo JSON com as colunas:
+      - 'CUSTO EMPRESA 80%'
+      - 'DESCONTO PROFISSIONAL 20%'
+    Valores inexistentes de TOTAL são tratados como 0.
+    """
+    df = pd.read_json(df_json, orient="records")
+    if "TOTAL" not in df.columns:
+        df["TOTAL"] = 0.0
+    df["CUSTO EMPRESA 80%"] = df["TOTAL"].fillna(0).astype(float).mul(0.80).round(2)
+    df["DESCONTO PROFISSIONAL 20%"] = df["TOTAL"].fillna(0).astype(float).mul(0.20).round(2)
+    return df.to_json(orient="records", force_ascii=False)
 
 @tool("calcular_dias_uteis")
 def calcular_dias_uteis(inicio: str, fim: str) -> int:
@@ -32,7 +145,6 @@ def calcular_dias_uteis(inicio: str, fim: str) -> int:
             dias += 1
     return dias
 
-
 def _find_column(ci: pd.Index, keywords: list[str]) -> Optional[str]:
     low = {c.lower(): c for c in ci}
     for k in keywords:
@@ -41,32 +153,26 @@ def _find_column(ci: pd.Index, keywords: list[str]) -> Optional[str]:
                 return orig
     return None
 
-
 @tool("aplicar_regra_desligamento_dia_15")
 def aplicar_regra_desligamento_dia_15(df_json: str, mes_referencia: str) -> str:
     """
-    Regra: se 'COMUNICADO DE DESLIGAMENTO' == 'OK' e a 'data de demissão' <= dia 15 do mês de referência (YYYY-MM),
-    então zere a coluna 'Dias'. Se > 15, o valor de 'Dias' deve ser proporcional até a data de demissão.
+    Regra: se comunicado de desligamento (status) contém 'OK' e a data do comunicado está no mês de referência (YYYY-MM)
+    e dia <= 15, zera 'Dias'. Se > 15, 'Dias' proporcional até a data do comunicado.
 
     Entradas:
-      - df_json: DataFrame (orient=records) com colunas incluindo 'COMUNICADO DE DESLIGAMENTO', 'Dias', 'TOTAL' e uma coluna de data de demissão.
+      - df_json: DataFrame (orient=records) com colunas incluindo status/data de comunicado (nomes flexíveis), 'Dias', 'TOTAL'.
       - mes_referencia: string no formato 'YYYY-MM'.
 
     Saída: df_json atualizado (orient=records).
     """
     df = pd.read_json(df_json, orient="records")
-
-    col_flag = None
-    for c in df.columns:
-        if c.strip().lower() == "comunicado de desligamento":
-            col_flag = c
-            break
-    if col_flag is None:
-        # se não existir, nada a aplicar
+    # Detecta colunas de status/data do comunicado de forma tolerante
+    col_flag = _find_column(df.columns, ["comunicado_status", "comunicado de desligamento", "comunicado"])  # status
+    col_data = _find_column(df.columns, ["data_comunicado", "comunicado_data", "data de deslig", "data de demiss", "deslig", "demiss"])  # data
+    if col_flag is None or col_data is None:
+        # sem ambos, não aplica
         return df.to_json(orient="records", force_ascii=False)
 
-    # Encontrar coluna de data de demissão por heurística
-    col_demissao = _find_column(df.columns, ["demiss", "deslig"])
     col_dias = None
     for c in df.columns:
         if c.strip().lower() == "dias":
@@ -91,12 +197,9 @@ def aplicar_regra_desligamento_dia_15(df_json: str, mes_referencia: str) -> str:
 
     def ajustar_linha(row: pd.Series) -> pd.Series:
         flag = str(row.get(col_flag, "")).strip().upper()
-        if flag != "OK":
+        if "OK" not in flag:
             return row
-        if not col_demissao:
-            # sem data, não conseguimos aplicar -> manter
-            return row
-        val = row.get(col_demissao)
+        val = row.get(col_data)
         if pd.isna(val):
             return row
         try:
@@ -120,116 +223,7 @@ def aplicar_regra_desligamento_dia_15(df_json: str, mes_referencia: str) -> str:
     df = df.apply(ajustar_linha, axis=1)
     return df.to_json(orient="records", force_ascii=False)
 
-
-@tool("calcular_rateio_80_20")
-def calcular_rateio_80_20(df_json: str) -> str:
-    """
-    Cria as colunas 'Custo empresa' (80%) e 'Desconto profissional' (20%) a partir da coluna 'TOTAL'.
-    Se 'TOTAL' não existir, tenta calcular como 'Dias' * 'VALOR DIÁRIO VR'.
-    Retorna df_json (orient=records).
-    """
-    df = pd.read_json(df_json, orient="records")
-    total_col = None
-    for c in df.columns:
-        if c.strip().upper() == "TOTAL":
-            total_col = c
-            break
-    if total_col is None:
-        # tentar derivar
-        col_dias = next((c for c in df.columns if c.strip().lower() == "dias"), None)
-        col_valor = next((c for c in df.columns if c.strip().lower() == "valor diário vr"), None)
-        if col_dias and col_valor:
-            total_col = "TOTAL"
-            df[total_col] = df[col_dias].astype(float) * df[col_valor].astype(float)
-        else:
-            # nada a fazer
-            return df.to_json(orient="records", force_ascii=False)
-
-    df["Custo empresa"] = (df[total_col].astype(float) * 0.80).round(2)
-    df["Desconto profissional"] = (df[total_col].astype(float) * 0.20).round(2)
-    return df.to_json(orient="records", force_ascii=False)
-
-
-@tool("executar_calculo_completo")
-def executar_calculo_completo(df_json: str, mes_referencia: str) -> str:
-    """
-    Orquestra as regras de cálculo sobre o DataFrame:
-      1) Aplicar regra de desligamento do dia 15 (zera dias <= 15 com desligamento OK; proporcional > 15)
-      2) Garantir/Calcular TOTAL (Dias * VALOR DIÁRIO VR) se ausente
-      3) Aplicar rateio 80/20
-
-    Retorna df_json (orient=records) atualizado.
-    """
-    df = pd.read_json(df_json, orient="records")
-
-    # 1) Regra dia 15
-    df_json = aplicar_regra_desligamento_dia_15(df.to_json(orient="records", force_ascii=False), mes_referencia)
-    df = pd.read_json(df_json, orient="records")
-
-    # 2) Garantir TOTAL
-    total_col = next((c for c in df.columns if c.strip().upper() == "TOTAL"), None)
-    if total_col is None:
-        col_dias = next((c for c in df.columns if c.strip().lower() == "dias"), None)
-        col_valor = next((c for c in df.columns if c.strip().lower() == "valor diário vr"), None)
-        if col_dias and col_valor:
-            df["TOTAL"] = df[col_dias].astype(float) * df[col_valor].astype(float)
-    # 3) Rateio 80/20
-    df_json = calcular_rateio_80_20(df.to_json(orient="records", force_ascii=False))
-    return df_json
-
-
-def _parse_mes_ref(mes_referencia: str) -> Tuple[date, date]:
-    y, m = map(int, mes_referencia.split("-"))
-    inicio = date(y, m, 1)
-    fim = date(y + (m == 12), (m % 12) + 1, 1) - timedelta(days=1)
-    return inicio, fim
-
-
-def _find_col(ci: pd.Index, keys: List[str]) -> Optional[str]:
-    low = {c.lower(): c for c in ci}
-    for k in keys:
-        for lc, orig in low.items():
-            if k in lc:
-                return orig
-    return None
-
-
-def _should_exclude(row: pd.Series) -> bool:
-    # Heurística de exclusões por cargo/categoria/flags
-    text_fields = []
-    for col in row.index:
-        lc = col.lower()
-        if any(x in lc for x in ["cargo", "categoria", "funcao", "função", "tipo", "perfil", "situacao", "situação", "status"]):
-            val = str(row.get(col, "")).lower()
-            text_fields.append(val)
-    blob = " ".join(text_fields)
-    excl = ["diretor", "diretoria", "estagi", "aprendiz", "exterior", "fora do brasil"]
-    if any(k in blob for k in excl):
-        return True
-    # afastados
-    if "afast" in blob or "licença" in blob or "licenca" in blob:
-        return True
-    return False
-
-
-def _intervalo_intersec(a_ini: date, a_fim: date, b_ini: date, b_fim: date) -> Optional[Tuple[date, date]]:
-    ini = max(a_ini, b_ini)
-    fim = min(a_fim, b_fim)
-    if ini <= fim:
-        return ini, fim
-    return None
-
-
-def _subtrai_periodos_uteis(base_ini: date, base_fim: date, uf: Optional[str], municipio: Optional[str], periodos: List[Tuple[date, date]]) -> int:
-    # Calcula dias úteis do período base menos os períodos (férias/afastamento)
-    total = dias_uteis_periodo(base_ini, base_fim, uf, municipio)
-    for (pi, pf) in periodos:
-        inter = _intervalo_intersec(base_ini, base_fim, pi, pf)
-        if inter:
-            di, df = inter
-            total -= dias_uteis_periodo(di, df, uf, municipio)
-    return max(total, 0)
-
+# ... (rest of the code remains the same)
 
 def executar_calculo_deterministico(df_json: str, mes_referencia: str) -> Tuple[str, str]:
     """
@@ -240,6 +234,21 @@ def executar_calculo_deterministico(df_json: str, mes_referencia: str) -> Tuple[
     df = pd.read_json(df_json, orient="records")
     validacoes: List[Dict[str, Any]] = []
     ini_mes, fim_mes = _parse_mes_ref(mes_referencia)
+
+    # Carregar base de valores por estado (fallback)
+    vr_estado_path = DADOS_DIR / "Base sindicato x valor.xlsx"
+    df_base_estado: Optional[pd.DataFrame] = None
+    if vr_estado_path.exists():
+        try:
+            df_base_estado = pd.read_excel(vr_estado_path)
+            # detectar colunas de estado e valor de forma tolerante
+            c_estado = _find_col(df_base_estado.columns, ["estado", "uf", "unidade federativa"]) or "estado"
+            c_valor = _find_col(df_base_estado.columns, ["valor", "vr", "vale refeicao"]) or "valor"
+            # normaliza
+            df_base_estado = df_base_estado.rename(columns={c_estado: "estado", c_valor: "valor"})
+            df_base_estado["estado_norm"] = df_base_estado["estado"].astype(str).str.strip().str.lower()
+        except Exception:
+            df_base_estado = None
 
     # localizar colunas chave por heurística
     col_matricula = _find_col(df.columns, ["matric"]) or "Matricula"
@@ -256,6 +265,19 @@ def executar_calculo_deterministico(df_json: str, mes_referencia: str) -> Tuple[
         df["VALOR DIÁRIO VR"] = 0.0
     if "TOTAL" not in df.columns:
         df["TOTAL"] = 0.0
+
+    # Enriquecimento: UF inferida pelo sindicato e valor de VR por estado
+    if col_sind:
+        df["uf_inferida"] = df[col_sind].apply(_extract_uf_from_sindicato)
+        df["estado_inferido"] = df["uf_inferida"].map(UF_MAP)
+        df["estado_norm"] = df["estado_inferido"].astype(str).str.strip().str.lower()
+        if df_base_estado is not None and not df_base_estado.empty:
+            df = df.merge(df_base_estado[["estado_norm", "valor"]], on="estado_norm", how="left")
+            df = df.rename(columns={"valor": "vr_valor_dia_estado"})
+        else:
+            df["vr_valor_dia_estado"] = None
+    else:
+        df["vr_valor_dia_estado"] = None
 
     # iterar linhas e computar dias
     for i, row in df.iterrows():
@@ -318,7 +340,7 @@ def executar_calculo_deterministico(df_json: str, mes_referencia: str) -> Tuple[
             dias_calc = 0
         df.at[i, "Dias"] = dias_calc
 
-        # resolver VR diário via regras_resolver
+        # resolver VR diário via regras_resolver (CCT) e fallback por estado
         sind = str(row.get(col_sind, "")).strip() if col_sind else ""
         regras = resolve_cct_rules(uf=uf or "", sindicato=sind)
         vr_valor = regras.get("vr_valor")
@@ -335,7 +357,14 @@ def executar_calculo_deterministico(df_json: str, mes_referencia: str) -> Tuple[
         except Exception:
             pass
         if vr_diario is None:
-            validacoes.append({"matricula": row.get(col_matricula), "msg": f"VR não encontrado para UF={uf}, Sindicato='{sind}'"})
+            ev = row.get("vr_valor_dia_estado")
+            if pd.notna(ev):
+                try:
+                    vr_diario = float(ev)
+                except Exception:
+                    vr_diario = None
+        if vr_diario is None:
+            validacoes.append({"matricula": row.get(col_matricula), "msg": f"Sem valor de VR (UF/sindicato/CCT). Aplicado 0."})
             vr_diario = 0.0
         df.at[i, "VALOR DIÁRIO VR"] = vr_diario
         df.at[i, "TOTAL"] = round(float(dias_calc) * float(vr_diario), 2)
@@ -401,3 +430,351 @@ def extrair_valores_cct(texto_cct: str, sindicato: str = "") -> str:
         "valor_vr": valor_vr,
         "valor_va": valor_va,
     }, ensure_ascii=False)
+
+
+def _find_file_by_keywords(base_dir: str, keywords: list[str]) -> str | None:
+    files = os.listdir(base_dir)
+    kw = [_norm_str(k).lower() for k in keywords]
+    for f in files:
+        nf = _norm_str(f).lower()
+        if all(k in nf for k in kw):
+            return str(Path(base_dir) / f)
+    return None
+
+def _find_col(cols, keys):
+    low = {c.lower(): c for c in cols}
+    for k in keys:
+        for lc, orig in low.items():
+            if k in lc:
+                return orig
+    return None
+
+@tool("calcular_financeiro_vr")
+def calcular_financeiro_vr(mes_referencia: str = "2025-05") -> str:
+    """
+    Consolida dados em dados_entrada/, aplica regras (exclusões, férias, afastamentos, admissão/desligamento, comunicado<=15),
+    resolve valor VR (CCT/sindicato/estado) e gera planilha final em relatorios_saida/VR_MENSAL_XX_YYYY_CALC.xlsx.
+    Retorna um JSON com {"saida_xlsx": <path>, "linhas": N, "total_empresa": ..., "total_profissional": ...}
+    """
+    base = Path(__file__).resolve().parent.parent
+    dados = base / "dados_entrada"
+    saida_dir = base / "relatorios_saida"
+    saida_dir.mkdir(parents=True, exist_ok=True)
+
+    # localizar arquivos
+    f_ativos    = _find_file_by_keywords(str(dados), ["ativos"])
+    f_ferias    = _find_file_by_keywords(str(dados), ["ferias"])
+    f_afast     = _find_file_by_keywords(str(dados), ["afast"])
+    f_deslig    = _find_file_by_keywords(str(dados), ["deslig"])
+    f_aprendiz  = _find_file_by_keywords(str(dados), ["aprend"])
+    f_estagio   = _find_file_by_keywords(str(dados), ["estag"])
+    f_exterior  = _find_file_by_keywords(str(dados), ["exterior"])
+    f_dias      = _find_file_by_keywords(str(dados), ["base","dias","uteis"])
+    f_valor     = _find_file_by_keywords(str(dados), ["base","sindicato","valor"])
+    f_adm       = _find_file_by_keywords(str(dados), ["admiss"])
+
+    def _read_xlsx(p):
+        if not p:
+            return pd.DataFrame()
+        path = str(p)
+        suf = Path(path).suffix.lower()
+        try:
+            if suf == ".csv":
+                df = pd.read_csv(path)
+            elif suf == ".xlsx":
+                df = pd.read_excel(path, engine="openpyxl")
+            elif suf == ".xls":
+                # Não suportamos .xls por padrão (xlrd não está no requirements). Solicitar conversão para .xlsx.
+                raise ValueError(f"Arquivo .xls não suportado: {path}. Converta para .xlsx.")
+            else:
+                # fallback tenta como excel
+                df = pd.read_excel(path, engine="openpyxl")
+        except Exception as e:
+            raise RuntimeError(f"Falha ao ler arquivo '{path}': {e}")
+        df.columns = [_norm_str(c).strip().lower().replace(" ", "_").replace("-", "_") for c in df.columns]
+        return df
+
+    ativos   = _read_xlsx(f_ativos)
+    ferias   = _read_xlsx(f_ferias)
+    afast    = _read_xlsx(f_afast)
+    deslig   = _read_xlsx(f_deslig)
+    aprendiz = _read_xlsx(f_aprendiz)
+    estagio  = _read_xlsx(f_estagio)
+    exterior = _read_xlsx(f_exterior)
+    diasut   = _read_xlsx(f_dias)
+    vr_est   = _read_xlsx(f_valor)
+    admis    = _read_xlsx(f_adm)
+
+    # ids
+    def _idcol(df):
+        return df.columns[0] if df is not None and len(df.columns) > 0 else None
+
+    id_ativos = _idcol(ativos)
+    if id_ativos is None or ativos.empty:
+        return json.dumps({"erro":"Base ATIVOS não encontrada ou vazia"})
+
+    # competência
+    y, m = map(int, mes_referencia.split("-"))
+    ini_mes = date(y, m, 1)
+    fim_mes = (date(y + (m//12), ((m%12)+1), 1) - timedelta(days=1))
+
+    # mapas auxiliares
+    def _intervalos(df, start_hints, end_hints, id_col):
+        out = {}
+        if df is None or df.empty or not id_col: return out
+        sc = _find_col(df.columns, start_hints)
+        ec = _find_col(df.columns, end_hints)
+        if not sc or not ec: return out
+        for _, r in df.iterrows():
+            try:
+                s = pd.to_datetime(r[sc]).date()
+                e = pd.to_datetime(r[ec]).date()
+            except Exception:
+                continue
+            s = max(s, ini_mes); e = min(e, fim_mes)
+            if e >= s:
+                out.setdefault(str(r[id_col]), []).append((s, e))
+        return out
+    fer_int = _intervalos(ferias, ["inicio","inicio_ferias","data_inicio"], ["fim","fim_ferias","data_fim"], _idcol(ferias) if not ferias.empty else None)
+    afa_int = _intervalos(afast,  ["inicio","data_inicio"], ["fim","data_fim"], _idcol(afast) if not afast.empty else None)
+
+    # admissão
+    adm_col = _find_col(admis.columns if admis is not None else [], ["data_admissao","admissao"]) 
+    adm_map = {}
+    if adm_col:
+        for _, r in admis.iterrows():
+            try:
+                adm_map[str(r[_idcol(admis)])] = pd.to_datetime(r[adm_col]).date()
+            except Exception:
+                pass
+
+    # desligamento - prioriza colunas de DATA específicas para evitar confundir com 'comunicado_de_desligamento'
+    def _pick_col_exact(df, candidates_contains: list[str]) -> str | None:
+        if df is None or df.empty:
+            return None
+        cols = [c for c in df.columns]
+        for c in cols:
+            lc = str(c).lower()
+            if any(k in lc for k in candidates_contains):
+                return c
+        return None
+
+    dcol = _pick_col_exact(deslig, ["data_demissao", "data_desligamento", "demissao"])  # data de demissão
+    # status do comunicado (texto tipo 'OK')
+    scol = None
+    if not deslig.empty:
+        for c in deslig.columns:
+            lc = str(c).lower()
+            if "comunicado" in lc and ("status" in lc or "desligamento" in lc):
+                scol = c
+                break
+    # data do comunicado
+    ccol = _pick_col_exact(deslig, ["data_comunicado", "comunicado_data"])
+    dmap = {}
+    for _, r in deslig.iterrows():
+        rid = str(r[_idcol(deslig)])
+        dd = pd.to_datetime(r[dcol]).date() if dcol and pd.notna(r.get(dcol)) else None
+        st = str(r.get(scol,"")).strip().upper() if scol else None
+        dc = pd.to_datetime(r[ccol]).date() if ccol and pd.notna(r.get(ccol)) else None
+        dmap[rid] = {"deslig": dd, "status": st, "com_data": dc}
+
+    # work base
+    nome_col = _find_col(ativos.columns, ["nome","colaborador","funcionario"])
+    sind_col = _find_col(ativos.columns, ["sindicato","sind"])
+    work = ativos[[id_ativos] + ([nome_col] if nome_col else []) + ([sind_col] if sind_col else [])].copy()
+    work.columns = ["matricula"] + (["nome"] if nome_col else []) + (["sindicato"] if sind_col else [])
+    work["matricula"] = work["matricula"].astype(str)
+
+    # exclusões
+    ids_ap = set(map(str, (aprendiz[_idcol(aprendiz)] if not aprendiz.empty else [])))
+    ids_es = set(map(str, (estagio[_idcol(estagio)] if not estagio.empty else [])))
+    ids_ex = set(map(str, (exterior[_idcol(exterior)] if not exterior.empty else [])))
+    work = work[~work["matricula"].isin(ids_ap | ids_es | ids_ex)].copy()
+
+    # dias uteis base
+    def _map_du(df, val_hints):
+        out = {}
+        if df is None or df.empty: return out
+        idc = df.columns[0]
+        cm = _find_col(df.columns, val_hints)
+        if not cm: return out
+        for _, r in df.iterrows():
+            try:
+                out[str(r[idc])] = int(float(r[cm]))
+            except Exception:
+                pass
+        return out
+
+    du_colab = _map_du(diasut, ["dias_uteis_mes_colaborador","dias_uteis_colaborador","dias_uteis"])
+    du_sind  = _map_du(diasut, ["dias_uteis_sindicato_mes","dias_uteis_sindicato","dias_sindicato","dias_uteis_mes"])
+
+    # fallback Mon-Fri do mês
+    month_business_days = len(pd.bdate_range(ini_mes, fim_mes))
+
+    # valor por estado
+    if not vr_est.empty:
+        ev_col = _find_col(vr_est.columns, ["estado","uf","unidade_federativa"]) or "estado"
+        vv_col = _find_col(vr_est.columns, ["valor","vr","vale_refeicao"]) or "valor"
+        vr_est["estado_norm"] = vr_est[ev_col].astype(str).str.strip().str.lower()
+    else:
+        vr_est = pd.DataFrame(columns=["estado_norm","valor"])
+
+    records = []
+    for _, r in work.iterrows():
+        mid = r["matricula"]
+        sind = r.get("sindicato","NA")
+        # janela
+        w_start = ini_mes
+        w_end   = fim_mes
+        if mid in adm_map and adm_map[mid] and adm_map[mid] > w_start:
+            w_start = adm_map[mid]
+        if mid in dmap and dmap[mid]["deslig"] and dmap[mid]["deslig"] < w_end:
+            w_end = dmap[mid]["deslig"]
+
+        # comunicado <=15
+        zerar = False
+        info = dmap.get(mid)
+        if info and info.get("status") and "OK" in info["status"]:
+            dc = info.get("com_data")
+            if dc and dc.year == y and dc.month == m and dc.day <= 15:
+                zerar = True
+
+        if w_end < w_start or zerar:
+            dias_pagos = 0
+        else:
+            dias_trab = len(pd.bdate_range(w_start, w_end))
+            # descontar ferias
+            df_fer = 0
+            if mid in fer_int:
+                for (s,e) in fer_int[mid]:
+                    s2 = max(w_start, s); e2 = min(w_end, e)
+                    if e2 >= s2: df_fer += len(pd.bdate_range(s2, e2))
+            # afast
+            df_af = 0
+            if mid in afa_int:
+                for (s,e) in afa_int[mid]:
+                    s2 = max(w_start, s); e2 = min(w_end, e)
+                    if e2 >= s2: df_af += len(pd.bdate_range(s2, e2))
+            dias_liq = max(0, dias_trab - df_fer - df_af)
+            dias_mes_sind = du_sind.get(mid, month_business_days)
+            dias_base_col = du_colab.get(mid, dias_mes_sind)
+            prop = dias_liq / month_business_days if month_business_days>0 else 0
+            dias_pagos = int(round(prop * dias_mes_sind))
+            dias_pagos = max(0, min(dias_pagos, dias_base_col, dias_mes_sind))
+
+        # valor por estado
+        uf = _extract_uf_from_sindicato(sind) if isinstance(sind, str) else None
+        est = UF_MAP.get(uf) if uf else None
+        estado_norm = str(est).strip().lower() if est else None
+        valor_dia = np.nan
+        origem = "NA"
+        if estado_norm and not vr_est.empty:
+            rowm = vr_est[vr_est["estado_norm"] == estado_norm]
+            if not rowm.empty:
+                valor_dia = float(rowm.iloc[0][vv_col])
+                origem = "ESTADO"
+
+        total = 0.0 if np.isnan(valor_dia) else round(dias_pagos * valor_dia, 2)
+        empresa = round(total * 0.80, 2)
+        prof = round(total * 0.20, 2)
+        obs = []
+        if zerar: obs.append("COMUNICADO<=15")
+        records.append([mid, r.get("nome",""), sind, uf, mes_referencia, None if np.isnan(valor_dia) else valor_dia, dias_pagos, total, empresa, prof, ";".join(obs) if obs else "OK", origem])
+
+    cols = [
+        "matricula","nome","sindicato","uf_inferida","ano_mes",
+        "vr_valor_dia_aplicado","dias_vr_pagos","vr_total_colaborador",
+        "custo_empresa_80","desconto_profissional_20","observacoes","origem_valor"
+    ]
+    df_out = pd.DataFrame(records, columns=cols)
+
+    # Preparar exportação com colunas renomeadas e formatadas
+    try:
+        # Matricula numérica
+        df_out["matricula_num"] = pd.to_numeric(df_out["matricula"], errors="coerce")
+        # Admissão formatada dd/mm/aaaa a partir do mapa de admissão original (se existir)
+        def _fmt_date(d):
+            try:
+                return d.strftime("%d/%m/%Y") if d is not None else ""
+            except Exception:
+                return ""
+        df_out["admissao_fmt"] = df_out["matricula"].map(lambda x: adm_map.get(x) if x in adm_map else None).apply(_fmt_date)
+        # Competência mm/aaaa
+        df_out["competencia_fmt"] = f"{m:02d}/{y}"
+        # Seleção e renomeação
+        export_cols = [
+            ("matricula_num", "Matricula"),
+            ("admissao_fmt", "Admissão"),
+            ("sindicato", "Sindicato do Colaborador"),
+            ("competencia_fmt", "Competência"),
+            ("dias_vr_pagos", "Dias"),
+            ("vr_valor_dia_aplicado", "VALOR DIÁRIO VR"),
+            ("vr_total_colaborador", "TOTAL"),
+            ("custo_empresa_80", "Custo empresa"),
+            ("desconto_profissional_20", "Desconto profissional"),
+        ]
+        df_exp = df_out[[c for c, _ in export_cols]].copy()
+        df_exp.columns = [n for _, n in export_cols]
+    except Exception:
+        # fallback: mantém layout antigo se algo falhar
+        df_exp = df_out.copy()
+
+    out_path = str(saida_dir / f"VR_MENSAL_{m:02d}_{y}_CALC.xlsx")
+    with pd.ExcelWriter(out_path, engine="openpyxl") as w:
+        df_exp.to_excel(w, sheet_name="VR_MENSAL", index=False)
+
+    # Sanity checks e export de erros
+    try:
+        assert float(df_out["vr_total_colaborador"].sum()) > 0, "Total geral deu 0 — verifique merge de valor (estado/sindicato) e comunicado<=15."
+    except AssertionError as e:
+        print(str(e))
+
+    print("Origem de valor (amostragem):")
+    origem_counts = {}
+    zerados_por_comunicado = 0
+    sem_valor_count = 0
+    try:
+        vc = df_out["origem_valor"].value_counts(dropna=False)
+        # normaliza chaves, tratando NaN como 'NA'
+        origem_counts = { ("NA" if (k!=k) else str(k)): int(v) for k, v in vc.to_dict().items() }
+        print(vc.head())
+    except Exception:
+        pass
+    try:
+        zerados_por_comunicado = int((df_out["observacoes"].str.contains("COMUNICADO<=15", na=False)).sum())
+        print("Zerados por comunicado<=15:", zerados_por_comunicado)
+    except Exception:
+        pass
+    try:
+        sem_valor_count = int((df_out["vr_valor_dia_aplicado"].isna()).sum())
+        print("Sem valor sindicato/estado:", sem_valor_count)
+    except Exception:
+        pass
+
+    # Gera arquivo de casos de erro (sem valor aplicado)
+    err_path = None
+    try:
+        errs = df_out[df_out["vr_valor_dia_aplicado"].isna()].copy()
+        if not errs.empty:
+            def _motivo(row):
+                if not row.get("uf_inferida"):
+                    return "UF não reconhecida no sindicato"
+                return "Estado sem valor na planilha Base sindicato x valor.xlsx"
+            errs["motivo_erro"] = errs.apply(_motivo, axis=1)
+            err_path = str(saida_dir / f"VR_MENSAL_{m:02d}_{y}_ERROS.csv")
+            errs[["matricula","nome","sindicato","uf_inferida","ano_mes","motivo_erro"]].to_csv(err_path, index=False, encoding="utf-8")
+    except Exception:
+        pass
+
+    return json.dumps({
+        "saida_xlsx": out_path,
+        "linhas": len(df_out),
+        "total_empresa": float(df_out["custo_empresa_80"].sum()),
+        "total_profissional": float(df_out["desconto_profissional_20"].sum()),
+        "total_geral": float(df_out["vr_total_colaborador"].sum()),
+        # Metricas de validação para UI
+        "origem_valor_counts": origem_counts,
+        "zerados_por_comunicado": zerados_por_comunicado,
+        "sem_valor_count": sem_valor_count,
+        "erros_csv": err_path,
+    })

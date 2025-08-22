@@ -221,9 +221,24 @@ def criar_agente_orquestrador() -> Callable[[str], str]:
                 mes_ref = f"{today.year}-{today.month:02d}"
             if not df_base_json:
                 df_base_json = "[]"
-            # log quantidade de linhas de entrada
+            # se vazio, tenta fallback direto da planilha ATIVOS.xlsx
             try:
                 _inp = json.loads(df_base_json)
+            except Exception:
+                _inp = []
+            if isinstance(_inp, list) and len(_inp) == 0:
+                try:
+                    base_dir = Path(__file__).resolve().parent.parent
+                    ativos_path = base_dir / "dados_entrada" / "ATIVOS.xlsx"
+                    if ativos_path.exists():
+                        df_fallback = pd.read_excel(ativos_path)
+                        df_base_json = df_fallback.to_json(orient="records", force_ascii=False)
+                        emit_progress("Cálculo Determinístico", "Fallback base ATIVOS.xlsx", "INFO", str(ativos_path.name))
+                        _inp = json.loads(df_base_json)
+                except Exception as _e:
+                    emit_progress("Cálculo Determinístico", "Fallback base ATIVOS.xlsx", "ERROR", str(_e))
+            # log quantidade de linhas de entrada
+            try:
                 emit_progress("Cálculo Determinístico", "Linhas de entrada", "INFO", f"{len(_inp)}")
             except Exception:
                 pass
@@ -245,11 +260,19 @@ def criar_agente_orquestrador() -> Callable[[str], str]:
             emit_progress("Cálculo Determinístico", "Processar base e aplicar regras", "DONE", f"Competência={mes_ref}")
 
             pkg_root = Path(__file__).resolve().parent.parent
-            out_path = str((pkg_root / "relatorios_saida" / "VR_MENSAL_05.2025.xlsx").as_posix())
+            # Gera nome dinâmico com base em mes_ref (YYYY-MM -> MM.YYYY)
+            try:
+                _ano, _mes = mes_ref.split("-")
+                nome_rel = f"VR_MENSAL_{_mes}.{_ano}.xlsx"
+                nome_aba = f"VR Mensal {_mes}.{_ano}"
+            except Exception:
+                nome_rel = "VR_MENSAL.xlsx"
+                nome_aba = "VR Mensal"
+            out_path = str((pkg_root / "relatorios_saida" / nome_rel).as_posix())
             salvar_planilha_final(
-                df_json=df_json_str,
+                df_json=df_calc_json,
                 caminho_saida=out_path,
-                nome_aba_principal="VR Mensal 05.2025",
+                nome_aba_principal=nome_aba,
                 validacoes_json=validacoes_json,
             )
             partes.append(f"\n[Relatório] Gerado em: {Path(out_path).resolve()}\n(Relativo: {out_path})")
@@ -263,10 +286,18 @@ def criar_agente_orquestrador() -> Callable[[str], str]:
                 ]
                 df_min = pd.DataFrame(columns=cols)
                 pkg_root = Path(__file__).resolve().parent.parent
-                out_path = pkg_root / "relatorios_saida" / "VR_MENSAL_05.2025.xlsx"
+                # Fallback mantém nome dinâmico também
+                try:
+                    _ano, _mes = mes_ref.split("-")
+                    nome_rel = f"VR_MENSAL_{_mes}.{_ano}.xlsx"
+                    nome_aba = f"VR Mensal {_mes}.{_ano}"
+                except Exception:
+                    nome_rel = "VR_MENSAL.xlsx"
+                    nome_aba = "VR Mensal"
+                out_path = pkg_root / "relatorios_saida" / nome_rel
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-                    df_min.to_excel(writer, index=False, sheet_name="VR Mensal 05.2025")
+                    df_min.to_excel(writer, index=False, sheet_name=nome_aba)
                 partes.append(f"\n[Relatório] Gerado via fallback em: {out_path.resolve()}")
                 validacoes_execucao.append("Relatório Excel gerado (fallback)")
             except Exception as e2:
@@ -280,7 +311,7 @@ def criar_agente_orquestrador() -> Callable[[str], str]:
             resumo = {
                 "status": "sucesso",
                 "validacoes": validacoes_execucao,
-                "relatorio": str((pkg_root / "relatorios_saida" / "VR_MENSAL_05.2025.xlsx").resolve()),
+                "relatorio": str((pkg_root / "relatorios_saida" / nome_rel).resolve()),
             }
             (outdir / "resultado_execucao.json").write_text(
                 json.dumps(resumo, ensure_ascii=False, indent=2), encoding="utf-8"

@@ -72,7 +72,7 @@ def is_feriado(d: date, uf: Optional[str], municipio: Optional[str]) -> bool:
             return True
     # feriado nacional (sem uf/municipio marcados)
     if ("uf" in sel.columns and sel["uf"].isna().any()) and ("municipio" in sel.columns and sel["municipio"].isna().any()):
-        return True
+            return True
     return False
 
 

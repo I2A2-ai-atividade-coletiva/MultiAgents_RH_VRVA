@@ -6,6 +6,8 @@ import streamlit as st
 from ferramentas.persistencia_db import DB_PATH
 import sys
 import json
+from ferramentas.calculadora_beneficios import calcular_financeiro_vr
+from io import BytesIO
 
 BASE_DIR = Path(__file__).resolve().parent
 DADOS_DIR = BASE_DIR / "dados_entrada"
@@ -35,37 +37,34 @@ if page == "Importar Relatórios Base":
     st.subheader("Importação de Relatórios Base")
     base_files = st.file_uploader(
         "Arquivos base (Excel/CSV)", accept_multiple_files=True,
-        type=["xlsx", "xls", "csv"], key="bases"
+        type=["xlsx", "csv"], key="bases"
     )
     if st.button("Salvar arquivos base"):
+        erros = []
+        ok = 0
         for f in base_files or []:
-            out_path = DADOS_DIR / f.name
-            with open(out_path, "wb") as out:
-                out.write(f.read())
-        st.success(f"Salvos em {DADOS_DIR}")
-
-    st.divider()
-    st.markdown("### Carregar um arquivo para o Banco (dados_consolidados)")
-    existentes = sorted([p.name for p in DADOS_DIR.glob("*.*") if p.suffix.lower() in (".xlsx", ".xls", ".csv")])
-    if not existentes:
-        st.info("Nenhum arquivo encontrado em dados_entrada/. Faça o upload acima.")
-    else:
-        sel = st.selectbox("Escolha um arquivo salvo em dados_entrada/", existentes)
-        if st.button("Carregar no DB como 'dados_consolidados'"):
             try:
-                fpath = DADOS_DIR / sel
-                if fpath.suffix.lower() == ".csv":
-                    df = pd.read_csv(fpath)
-                else:
-                    df = pd.read_excel(fpath)
-                from ferramentas.persistencia_db import salvar_dataframe_db
-                msg = salvar_dataframe_db.invoke({
-                    "df_json": df.to_json(orient="records", force_ascii=False, date_format="iso"),
-                    "nome_tabela": "dados_consolidados",
-                })
-                st.success(f"{msg}")
+                name = f.name
+                data = f.getbuffer()
+                suffix = Path(name).suffix.lower()
+                # valida excel (.xlsx)
+                if suffix == ".xlsx":
+                    bio = BytesIO(bytes(data))
+                    # tentar ler primeira aba para validar
+                    _ = pd.read_excel(bio, engine="openpyxl")
+                elif suffix == ".xls":
+                    raise ValueError("Formato .xls não suportado. Converta para .xlsx antes de enviar.")
+                # csv: leitura opcional rápida (não falha upload)
+                out_path = DADOS_DIR / name
+                with open(out_path, "wb") as out:
+                    out.write(data)
+                ok += 1
             except Exception as e:
-                st.error(f"Falha ao carregar no DB: {e}")
+                erros.append(f"{f.name}: {e}")
+        if ok:
+            st.success(f"{ok} arquivo(s) salvo(s) em {DADOS_DIR}")
+        if erros:
+            st.error("Falha ao validar/salvar alguns arquivos:\n" + "\n".join(erros))
 
     st.divider()
     st.markdown("### Carregar TODOS os arquivos de dados_entrada/ para o Banco (uma tabela por arquivo/aba)")
@@ -114,52 +113,52 @@ if page == "Importar Relatórios Base":
         except Exception as e:
             st.error(f"Falha no carregamento em massa: {e}")
 
-    st.divider()
-    st.markdown("### Gerar TABELA FINAL limpa (exclusões + junção com regras)")
-    st.caption("Seleciona uma tabela de entrada do SQLite, aplica o cálculo determinístico (com exclusões e CCT) e salva em 'dados_final'.")
-    try:
-        from ferramentas.persistencia_db import listar_tabelas_db, carregar_dataframe_db, salvar_dataframe_db
-        import json as _json
-        from datetime import date as _date
-        from ferramentas.calculadora_beneficios import executar_calculo_deterministico
+    # (Seção removida: geração de tabela final e carga individual para dados_consolidados)
 
-        nomes_json = listar_tabelas_db.invoke({})
-        nomes = []
+    st.divider()
+    st.markdown("### Validação rápida de VR (amostragem)")
+    st.caption("Executa um cálculo rápido para sinalizar casos que podem exigir validação: origem de valor, comunicados até dia 15 e linhas sem valor.")
+    from datetime import date as _date
+    hoje = _date.today()
+    comp_val = st.text_input("Competência p/ validação (YYYY-MM)", value=f"{hoje.year}-{hoje.month:02d}", key="comp_valid")
+    if st.button("Executar validação"):
         try:
-            parsed = _json.loads(nomes_json)
-            if isinstance(parsed, list):
-                nomes = parsed
-        except Exception:
-            pass
-        sel_tab = st.selectbox("Tabela de entrada no SQLite", nomes, index=nomes.index("dados_consolidados") if "dados_consolidados" in nomes else 0 if nomes else None)
-        col1, col2 = st.columns([1,1])
-        with col1:
-            hoje = _date.today()
-            mes_ref = st.text_input("Competência (YYYY-MM)", value=f"{hoje.year}-{hoje.month:02d}")
-        with col2:
-            nome_saida = st.text_input("Nome da tabela de saída", value="dados_final")
-        if st.button("Gerar tabela final"):
-            try:
-                base_json = carregar_dataframe_db.invoke({"nome_tabela": sel_tab})
-                calc_json, valid_json = executar_calculo_deterministico(base_json, mes_ref)
-                msg = salvar_dataframe_db.invoke({
-                    "df_json": calc_json,
-                    "nome_tabela": nome_saida,
-                })
-                try:
-                    v = _json.loads(valid_json) if valid_json else []
-                    if v:
-                        salvar_dataframe_db.invoke({
-                            "df_json": _json.dumps(v, ensure_ascii=False),
-                            "nome_tabela": f"{nome_saida}_validacoes",
-                        })
-                except Exception:
-                    pass
-                st.success(msg)
-            except Exception as e:
-                st.error(f"Falha ao gerar tabela final: {e}")
-    except Exception as e:
-        st.info("Banco SQLite ainda não inicializado ou sem tabelas.")
+            res = json.loads(calcular_financeiro_vr.run(comp_val))
+            # Origem de valor
+            counts = res.get("origem_valor_counts", {}) or {}
+            if counts:
+                df_counts = pd.DataFrame(
+                    sorted(((k, v) for k, v in counts.items()), key=lambda x: (-x[1], x[0])),
+                    columns=["origem_valor", "count"],
+                )
+                st.markdown("**Origem de valor (amostragem):**")
+                st.dataframe(df_counts, use_container_width=True, hide_index=True)
+            else:
+                st.info("Sem dados de origem de valor.")
+
+            # Métricas principais
+            colA, colB = st.columns(2)
+            with colA:
+                st.metric("Zerados por comunicado<=15", value=int(res.get("zerados_por_comunicado", 0)))
+            with colB:
+                st.metric("Sem valor sindicato/estado", value=int(res.get("sem_valor_count", 0)))
+
+            # Erros CSV
+            err_csv = res.get("erros_csv")
+            sem_val = int(res.get("sem_valor_count", 0))
+            if sem_val > 0 and err_csv and Path(err_csv).exists():
+                st.warning(f"Há {sem_val} linha(s) sem valor aplicado. Baixe a amostra para revisar.")
+                with open(err_csv, "rb") as fp:
+                    st.download_button(
+                        "Baixar CSV de erros",
+                        fp.read(),
+                        file_name=Path(err_csv).name,
+                        mime="text/csv",
+                    )
+            elif sem_val > 0:
+                st.warning("Há linhas sem valor aplicado, mas o CSV de erros não foi encontrado.")
+        except Exception as e:
+            st.error(f"Falha na validação: {e}")
 
 # Página: Importar CCTs
 elif page == "Importar CCTs":
@@ -487,8 +486,7 @@ elif page == "Dashboard":
                 cwd=str(BASE_DIR), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1, env=env
             )
-            log = st.empty()
-            lines = []
+            # Não exibimos log bruto; apenas status tabular
             steps = []  # lista de dicts {agent, action, status, info}
             for line in proc.stdout:
                 ln = line.rstrip()
@@ -514,9 +512,6 @@ elif page == "Dashboard":
                         import pandas as _pd
                         steps_df = _pd.DataFrame(steps)
                         steps_placeholder.dataframe(steps_df, use_container_width=True, hide_index=True)
-                # Log completo
-                lines.append(ln)
-                log.code("\n".join(lines))
             proc.wait()
             status_placeholder.success("Processo concluído.")
             st.success(f"Orquestração finalizada (exit={proc.returncode}).")
@@ -565,23 +560,7 @@ elif page == "Dashboard":
         except Exception as e:
             st.warning(f"Falha ao carregar histórico: {e}")
 
-    st.divider()
-    # Exibe resumos de regras e compliance se existirem
-    regras_path = RELATORIOS_DIR / "regras.txt"
-    comp_path = RELATORIOS_DIR / "compliance.txt"
-    cols = st.columns(2)
-    with cols[0]:
-        st.markdown("**Regras (CCT):**")
-        if regras_path.exists():
-            st.code(regras_path.read_text(encoding="utf-8")[:15000])
-        else:
-            st.info("Sem resumo de regras disponível ainda.")
-    with cols[1]:
-        st.markdown("**Compliance:**")
-        if comp_path.exists():
-            st.code(comp_path.read_text(encoding="utf-8")[:15000])
-        else:
-            st.info("Sem resumo de compliance disponível ainda.")
+    # (Seções removidas: Regras (CCT) e Compliance)
 
     st.divider()
     st.subheader("Banco de Dados (SQLite)")
@@ -617,53 +596,43 @@ elif page == "Dashboard":
     else:
         st.info("Banco ainda não criado.")
 
+    # (Seção removida: Arquivos gerados)
+
     st.divider()
-    st.subheader("Arquivos gerados")
-    st.button("Atualizar lista")
-    files = sorted(RELATORIOS_DIR.glob("*.xlsx"))
-    if not files:
-        st.info("Nenhum relatório encontrado ainda.")
-    else:
-        names = [f.name for f in files]
-        sel_file = st.selectbox("Selecione um relatório para revisar", names)
-        path = RELATORIOS_DIR / sel_file
-
-        # Carrega Excel
-        xls = pd.ExcelFile(path)
-        sheet_default = xls.sheet_names[0]
-        df_main = pd.read_excel(xls, sheet_name=sheet_default)
-        df_val = None
-        if "Validações" in xls.sheet_names:
-            df_val = pd.read_excel(xls, sheet_name="Validações")
-
-        st.write("Aba principal:")
-        df_edit = st.data_editor(df_main, use_container_width=True, num_rows="dynamic")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            new_sheet = st.text_input("Nome da aba principal", value=sheet_default)
-        with col2:
-            new_filename = st.text_input("Nome do arquivo de saída", value=sel_file)
-
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("Salvar alterações no arquivo"):
-                out_path = RELATORIOS_DIR / new_filename
-                with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-                    df_edit.to_excel(writer, index=False, sheet_name=new_sheet)
-                    if df_val is not None:
-                        # garante colunas Validações/Check
-                        if "Validações" not in df_val.columns or "Check" not in df_val.columns:
-                            df_val = df_val.rename(columns={list(df_val.columns)[0]: "Validações"})
-                            if "Check" not in df_val.columns:
-                                df_val["Check"] = None
-                        df_val[["Validações", "Check"]].to_excel(writer, index=False, sheet_name="Validações")
-                st.success(f"Arquivo salvo em {out_path}")
-        with c2:
-            with open(path, "rb") as fp:
+    st.markdown("### Gerar VR Mensal (com fallback por UF → Estado)")
+    from datetime import date as _date
+    hoje = _date.today()
+    colc, coln = st.columns(2)
+    with colc:
+        competencia = st.text_input("Competência (YYYY-MM)", value=f"{hoje.year}-{hoje.month:02d}")
+    with coln:
+        nome_arquivo = st.text_input("Nome do arquivo de exportação", value=f"VR_MENSAL_{hoje.month:02d}.{hoje.year}.xlsx")
+    if st.button("Gerar Relatório VR"):
+        try:
+            # LangChain Tool expects positional tool_input
+            res = json.loads(calcular_financeiro_vr.run(competencia))
+            total_fmt = f"R$ {res['total_geral']:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            st.success(f"Linhas: {res['linhas']} | Total: {total_fmt}")
+            # preparar arquivo de exportação com nome customizado
+            export_path = Path(res["saida_xlsx"])  # default
+            try:
+                desired = (nome_arquivo or "").strip()
+                if desired:
+                    if not desired.lower().endswith(".xlsx"):
+                        desired += ".xlsx"
+                    custom_path = RELATORIOS_DIR / desired
+                    # copia bytes do arquivo gerado para o nome desejado
+                    with open(res["saida_xlsx"], "rb") as src, open(custom_path, "wb") as dst:
+                        dst.write(src.read())
+                    export_path = custom_path
+            except Exception as _:
+                pass
+            with open(export_path, "rb") as f:
                 st.download_button(
-                    label="Baixar arquivo atual",
-                    data=fp.read(),
-                    file_name=path.name,
+                    "Baixar Relatório VR",
+                    f,
+                    file_name=export_path.name,
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
+        except Exception as e:
+            st.error(f"Falha ao gerar VR: {e}")
