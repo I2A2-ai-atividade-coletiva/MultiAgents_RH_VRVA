@@ -4,6 +4,7 @@ from utils.prompt_loader import carregar_prompt
 from agentes.especialista_dados import criar_agente_dados
 from agentes.analista_cct import criar_agente_cct
 from agentes.especialista_compliance import criar_agente_compliance
+from agentes.coletor_cct import criar_agente_coletor_cct
 from agentes.especialista_calculo import criar_agente_calculo
 from ferramentas.gerador_relatorio import salvar_planilha_final
 from ferramentas.calculadora_beneficios import executar_calculo_deterministico
@@ -24,6 +25,7 @@ def criar_agente_orquestrador() -> Callable[[str], str]:
 
     # Instancia especialistas (versões simples com LLM já integrados)
     agente_dados = criar_agente_dados()
+    agente_coletor_cct = criar_agente_coletor_cct()
     agente_compliance = criar_agente_compliance()
     agente_calculo = criar_agente_calculo()
 
@@ -33,6 +35,15 @@ def criar_agente_orquestrador() -> Callable[[str], str]:
         outdir = pkg_root / "relatorios_saida"
         outdir.mkdir(parents=True, exist_ok=True)
         progress_path = outdir / "progresso_execucao.jsonl"
+        status_path = outdir / "status.log"
+
+        def write_status(msg: str):
+            try:
+                outdir.mkdir(parents=True, exist_ok=True)
+                with status_path.open("a", encoding="utf-8") as fp:
+                    fp.write(msg.strip() + "\n")
+            except Exception:
+                pass
 
         def emit_progress(agent: str, action: str, status: str, info: str | None = None):
             rec = {"agent": agent, "action": action, "status": status}
@@ -47,7 +58,7 @@ def criar_agente_orquestrador() -> Callable[[str], str]:
             print(f"::STEP::{agent}::{action}::{status}:: {info or ''}")
         cabecalho = [
             "[Orquestrador] Tarefa recebida.",
-            "Sequência: Dados -> CCT -> Compliance -> Cálculo.",
+            "Sequência: Dados -> Coletor CCT -> CCT -> Compliance -> Cálculo.",
         ]
         # Coleta de validações para exibição no Dashboard
         validacoes_execucao: list[str] = []
@@ -65,7 +76,10 @@ def criar_agente_orquestrador() -> Callable[[str], str]:
                 return None
             return None
 
+        # Status inicial
+        write_status("Iniciando o processo...")
         emit_progress("Especialista de Dados", "Consolidação de bases", "START")
+        write_status("Agente em ação: Especialista de Dados - Consolidação de bases")
         print("Iniciando o trabalho do Especialista de Dados...")
         try:
             saida_dados = agente_dados(
@@ -74,26 +88,22 @@ def criar_agente_orquestrador() -> Callable[[str], str]:
         except Exception as e:
             saida_dados = f"[Erro Dados] {e}"
             emit_progress("Especialista de Dados", "Consolidação de bases", "ERROR", str(e))
+            write_status(f"Especialista de Dados - ERRO: {e}")
         else:
             validacoes_execucao.append("Dados ingeridos e consolidados")
             emit_progress("Especialista de Dados", "Consolidação de bases", "DONE")
+            write_status("Especialista de Dados - Concluído")
         # Persistência tentativa: dados_consolidados
         try:
             arr = _primeiro_json_array(saida_dados)
             if arr is not None:
                 dfjson = json.dumps(arr, ensure_ascii=False)
-                salvar_dataframe_db.invoke({
-                    "df_json": dfjson,
-                    "nome_tabela": "dados_consolidados",
-                })
+                salvar_dataframe_db(dfjson, "dados_consolidados")
                 # Normaliza nomes de sindicatos e salva tabela normalizada
                 try:
                     emit_progress("Especialista de Dados", "Normalizar sindicatos", "START")
                     dfjson_norm = normalizar_nomes_sindicatos(dfjson)
-                    salvar_dataframe_db.invoke({
-                        "df_json": dfjson_norm,
-                        "nome_tabela": "dados_consolidados_norm",
-                    })
+                    salvar_dataframe_db(dfjson_norm, "dados_consolidados_norm")
                     emit_progress("Especialista de Dados", "Normalizar sindicatos", "DONE")
                 except Exception:
                     emit_progress("Especialista de Dados", "Normalizar sindicatos", "SKIP")
@@ -111,7 +121,32 @@ def criar_agente_orquestrador() -> Callable[[str], str]:
                     encontrados.add(sigla)
             return sorted(encontrados)
 
+        # Coletor CCT: consolida rules_index em um resumo estruturado por (UF, Sindicato)
+        emit_progress("Coletor CCT", "Consolidação CCT index", "START")
+        write_status("Agente em ação: Coletor CCT - Consolidação CCT index")
+        print("Iniciando o trabalho do Coletor CCT...")
+        try:
+            instr = "Consolide rules_index por UF/Sindicato e marque pendências. Retorne apenas um array JSON."
+            saida_coletor = agente_coletor_cct(instr)
+        except Exception as e:
+            saida_coletor = f"[Erro Coletor CCT] {e}"
+            emit_progress("Coletor CCT", "Consolidação CCT index", "ERROR", str(e))
+            write_status(f"Coletor CCT - ERRO: {e}")
+        else:
+            validacoes_execucao.append("Resumo CCT consolidado")
+            emit_progress("Coletor CCT", "Consolidação CCT index", "DONE")
+            write_status("Coletor CCT - Concluído")
+        # Persistência tentativa: regras_cct_resumo
+        try:
+            arr = _primeiro_json_array(saida_coletor)
+            if arr is not None:
+                dfjson = json.dumps(arr, ensure_ascii=False)
+                salvar_dataframe_db(dfjson, "regras_cct_resumo")
+        except Exception:
+            pass
+
         emit_progress("Analista de CCT", "Consulta às CCTs", "START")
+        write_status("Agente em ação: Analista de CCT - Consulta às CCTs")
         print("Iniciando o trabalho do Analista de CCT...")
         try:
             ufs_detectadas = extrai_ufs(str(saida_dados))
@@ -121,23 +156,28 @@ def criar_agente_orquestrador() -> Callable[[str], str]:
         except Exception as e:
             saida_cct = f"[Erro CCT] {e}"
             emit_progress("Analista de CCT", "Consulta às CCTs", "ERROR", str(e))
+            write_status(f"Analista de CCT - ERRO: {e}")
         else:
             validacoes_execucao.append("Regras CCT analisadas")
             emit_progress("Analista de CCT", "Consulta às CCTs", "DONE")
+            write_status("Analista de CCT - Concluído")
 
         instr_compliance = (
             "Verifique aderência às políticas internas para elegibilidade e limites; liste pendências."
         )
         emit_progress("Especialista em Compliance", "Aplicar regras internas", "START")
+        write_status("Agente em ação: Especialista em Compliance - Aplicar regras internas")
         print("Iniciando o trabalho do Especialista em Compliance...")
         try:
             saida_compliance = agente_compliance(instr_compliance)
         except Exception as e:
             saida_compliance = f"[Erro Compliance] {e}"
             emit_progress("Especialista em Compliance", "Aplicar regras internas", "ERROR", str(e))
+            write_status(f"Especialista em Compliance - ERRO: {e}")
         else:
             validacoes_execucao.append("Compliance aplicado")
             emit_progress("Especialista em Compliance", "Aplicar regras internas", "DONE")
+            write_status("Especialista em Compliance - Concluído")
         # Persistência tentativa: dados_compliance_ok
         try:
             arr = _primeiro_json_array(saida_compliance)
@@ -154,15 +194,18 @@ def criar_agente_orquestrador() -> Callable[[str], str]:
             "Com base nos dados consolidados e nas regras das CCTs, calcule VR/VA finais e ressalte regras aplicadas."
         )
         emit_progress("Especialista em Cálculo", "Cálculo de VR/VA", "START")
+        write_status("Agente em ação: Especialista em Cálculo - Cálculo de VR/VA")
         print("Iniciando o trabalho do Especialista em Cálculo...")
         try:
             saida_calculo = agente_calculo(instr_calculo)
         except Exception as e:
             saida_calculo = f"[Erro Cálculo] {e}"
             emit_progress("Especialista em Cálculo", "Cálculo de VR/VA", "ERROR", str(e))
+            write_status(f"Especialista em Cálculo - ERRO: {e}")
         else:
             validacoes_execucao.append("Cálculo concluído")
             emit_progress("Especialista em Cálculo", "Cálculo de VR/VA", "DONE")
+            write_status("Especialista em Cálculo - Concluído")
         # Persistência tentativa: dados_calculo_final
         try:
             arr = _primeiro_json_array(saida_calculo)
@@ -199,12 +242,13 @@ def criar_agente_orquestrador() -> Callable[[str], str]:
 
         # Etapa determinística: cálculo de dias/valores com feriados, férias, desligamentos e 80/20
         emit_progress("Cálculo Determinístico", "Processar base e aplicar regras", "START")
+        write_status("Agente em ação: Cálculo Determinístico - Processar base e aplicar regras")
         df_base_json = None
         try:
             # prioridade de base: compliance_ok -> consolidado_norm -> consolidado
             for key_tbl in ("dados_compliance_ok", "dados_consolidados_norm", "dados_consolidados"):
                 try:
-                    tmp = carregar_dataframe_db.invoke({"nome_tabela": key_tbl})
+                    tmp = carregar_dataframe_db(key_tbl)
                     if tmp:
                         df_base_json = tmp
                         break
@@ -251,13 +295,11 @@ def criar_agente_orquestrador() -> Callable[[str], str]:
                 pass
             # Persiste resultado determinístico para geração do Excel
             try:
-                salvar_dataframe_db.invoke({
-                    "df_json": df_calc_json,
-                    "nome_tabela": "dados_calculo_final",
-                })
+                salvar_dataframe_db(df_calc_json, "dados_calculo_final")
             except Exception:
                 pass
             emit_progress("Cálculo Determinístico", "Processar base e aplicar regras", "DONE", f"Competência={mes_ref}")
+            write_status("Cálculo Determinístico - Concluído")
 
             pkg_root = Path(__file__).resolve().parent.parent
             # Gera nome dinâmico com base em mes_ref (YYYY-MM -> MM.YYYY)
@@ -317,6 +359,7 @@ def criar_agente_orquestrador() -> Callable[[str], str]:
                 json.dumps(resumo, ensure_ascii=False, indent=2), encoding="utf-8"
             )
             emit_progress("Orquestrador", "Finalização", "DONE")
+            write_status("Processo concluído com sucesso.")
         except Exception:
             pass
 

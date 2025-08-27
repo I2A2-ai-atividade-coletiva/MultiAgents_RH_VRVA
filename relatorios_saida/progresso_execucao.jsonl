@@ -1,5 +1,7 @@
 {"agent": "Especialista de Dados", "action": "Consolidação de bases", "status": "START"}
 {"agent": "Especialista de Dados", "action": "Consolidação de bases", "status": "DONE"}
+{"agent": "Coletor CCT", "action": "Consolidação CCT index", "status": "START"}
+{"agent": "Coletor CCT", "action": "Consolidação CCT index", "status": "DONE"}
 {"agent": "Analista de CCT", "action": "Consulta às CCTs", "status": "START"}
 {"agent": "Analista de CCT", "action": "Consulta às CCTs", "status": "DONE"}
 {"agent": "Especialista em Compliance", "action": "Aplicar regras internas", "status": "START"}
@@ -9,4 +11,6 @@
 {"agent": "Cálculo Determinístico", "action": "Processar base e aplicar regras", "status": "START"}
 {"agent": "Cálculo Determinístico", "action": "Fallback base ATIVOS.xlsx", "status": "INFO", "info": "ATIVOS.xlsx"}
 {"agent": "Cálculo Determinístico", "action": "Linhas de entrada", "status": "INFO", "info": "1815"}
+{"agent": "Cálculo Determinístico", "action": "Linhas de saída", "status": "INFO", "info": "1815"}
+{"agent": "Cálculo Determinístico", "action": "Processar base e aplicar regras", "status": "DONE", "info": "Competência=2025-08"}
 {"agent": "Orquestrador", "action": "Finalização", "status": "DONE"}

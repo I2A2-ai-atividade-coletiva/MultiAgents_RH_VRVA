@@ -36,7 +36,7 @@ def salvar_dataframe_db(df_json: str, nome_tabela: str) -> str:
             df.to_sql(nome_tabela, conn, if_exists="replace", index=False)
         return f"OK: tabela '{nome_tabela}' com {len(df)} linhas salva em {DB_PATH.name}."
     except Exception as e:
-        return f"ERRO salvar_dataframe_db('{nome_tabela}'): {e}"
+        return f"ERRO ao salvar '{nome_tabela}': {e}"
 
 
 @tool("carregar_dataframe_db")

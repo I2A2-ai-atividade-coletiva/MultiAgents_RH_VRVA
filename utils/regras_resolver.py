@@ -7,10 +7,11 @@ from chromadb.config import Settings
 import sqlite3
 import pandas as pd
 from ferramentas.persistencia_db import DB_PATH
+from ferramentas.extracao_cct_llm import extrair_regras_da_cct
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 CHROMA_DIR = BASE_DIR / "base_conhecimento" / "chromadb"
-RULES_INDEX = CHROMA_DIR / "rules_index.json"
+RULES_INDEX = BASE_DIR / "base_conhecimento" / "rules_index.json"
 RULES_OVERRIDES = CHROMA_DIR / "rules_overrides.json"
 
 
@@ -58,6 +59,44 @@ def resolve_cct_rules(uf: str, sindicato: str) -> Dict[str, Any]:
             if out:
                 out["origem"] = "ocr_index"
                 return out
+
+    # 2.5) LLM extraction a partir do texto das CCTs (Chroma) quando não há match direto no índice
+    #      Junta os documentos do UF/Sindicato e extrai {valor_vr, valor_va, dias_uteis}
+    try:
+        client = chromadb.PersistentClient(path=str(CHROMA_DIR), settings=Settings(allow_reset=False))
+        collection = client.get_or_create_collection("ccts")
+        where = {"uf": uf_key, "sindicato": sind_key}
+        res = collection.query(query_texts=["regras de VR VA dias"], n_results=6, where=where)
+        docs = res.get("documents", [[]])[0]
+        if docs:
+            # limita tamanho para evitar prompt muito grande
+            joined = "\n\n".join(docs)
+            texto_cct = joined[:20000]
+            try:
+                payload = extrair_regras_da_cct(texto_cct)
+                # ferramenta retorna JSON string
+                data = json.loads(payload) if isinstance(payload, str) else payload
+                out = {}
+                if isinstance(data, dict):
+                    vr = data.get("valor_vr")
+                    va = data.get("valor_va")
+                    dias = data.get("dias_uteis")
+                    if vr is not None:
+                        out["vr_valor"] = vr
+                    if va is not None:
+                        out["va_valor"] = va
+                    if dias is not None:
+                        try:
+                            out["dias"] = int(dias)
+                        except Exception:
+                            pass
+                if out:
+                    out["origem"] = "llm_extract"
+                    return out
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     # 3) Lookup em SQLite (tabelas importadas via Streamlit)
     #    Procuramos tabelas com nomes que contenham 'sindicato' e 'valor' (ex.: base_sindicato_x_valor[_sheet])

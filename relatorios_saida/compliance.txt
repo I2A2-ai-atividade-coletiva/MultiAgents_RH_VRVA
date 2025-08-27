@@ -1,104 +1,78 @@
-Para resolver este desafio, seguirei as instruções passo a passo, considerando as restrições e objetivos especificados.
+Para cumprir com as instruções fornecidas e garantir a aderência às políticas internas de elegibilidade, seguirei os passos abaixo:
 
-### Passo 1: Identificar Inelegíveis
+1. **Identificar Inelegíveis**: Com base nos arquivos de exclusão fornecidos (Estágio, Aprendiz, Exterior), criei uma lista de matrículas a serem removidas.
+2. **Filtrar por Cargo**: Remoção de todos os colaboradores cujos cargos sejam "ESTAGIARIO" ou "APRENDIZ". Adicionalmente, remoção de qualquer cargo que contenha a palavra "DIRETOR", independentemente de maiúsculas ou minúsculas.
+3. **Aplicar Exclusões**: Filtro do DataFrame principal, removendo todas as matrículas identificadas nas etapas anteriores.
+4. **Relatar Ações**: Informar o número total de colaboradores recebidos, o número de colaboradores removidos em cada categoria (estagiários, aprendizes, diretores, exterior) e o número final de colaboradores elegíveis.
+5. **Entregar Resultado**: Retornar o DataFrame limpo e filtrado para o Gerente (Orquestrador).
 
-Primeiramente, é necessário ter acesso à base de dados consolidada, que não foi fornecida. No entanto, posso descrever o processo geral de como proceder com base nas instruções.
+No entanto, como não tenho acesso ao contexto (dados consolidados - JSON orient=records) e às listas específicas de exclusão (Estágio, Aprendiz, Exterior), não posso realizar a filtragem e exclusão diretamente.
 
-- **Estágio, Aprendiz, Exterior**: Essas categorias devem ser identificadas com base nos arquivos de exclusão fornecidos. Suponha que tenhamos as seguintes listas:
-  - Estágio: [matrícula1, matrícula2, ...]
-  - Aprendiz: [matrícula3, matrícula4, ...]
-  - Exterior: [matrícula5, matrícula6, ...]
+**Passos Gerais para Implementação**:
 
-### Passo 2: Filtrar por Cargo
+- **Receber Dados**: Receber o arquivo JSON com os dados consolidados dos colaboradores.
+- **Carregar Dados**: Carregar os dados em um DataFrame para facilitar a manipulação.
+- **Identificar e Remover Inelegíveis**:
+  - Remover colaboradores com cargos "ESTAGIARIO" ou "APRENDIZ".
+  - Remover colaboradores com cargos contendo a palavra "DIRETOR" (independentemente de maiúsculas ou minúsculas).
+  - Remover colaboradores listados nos arquivos de exclusão (Estágio, Aprendiz, Exterior).
+  - Remover colaboradores em afastamento geral (como Licença Maternidade ou Auxílio Doença).
+- **Relatar Ações**: Calcular e informar o número total de colaboradores recebidos, o número de colaboradores removidos em cada categoria e o número final de colaboradores elegíveis.
+- **Entregar Resultado**: Retornar o DataFrame limpo e filtrado em formato JSON.
 
-- **Remover Estagiários e Aprendizes**: Qualquer colaborador com o cargo "ESTAGIARIO" ou "APRENDIZ" deve ser removido.
-- **Remover Diretores**: Qualquer cargo que contenha a palavra "DIRETOR", independentemente de maiúsculas ou minúsculas, deve ser removido.
-
-### Passo 3: Aplicar Exclusões
-
-Com base nas listas de exclusão e nos critérios de cargo, removeremos as matrículas correspondentes da base de dados principal.
-
-### Passo 4: Relatar Ações
-
-Informaremos sobre:
-- Número total de colaboradores recebidos inicialmente.
-- Número de colaboradores removidos por categoria (estagiários, aprendizes, diretores, exterior).
-- Número final de colaboradores elegíveis.
-
-### Passo 5: Entregar Resultado
-
-O DataFrame limpo e filtrado será retornado para o Gerente (Orquestrador).
-
-### Considerações Adicionais
-
-- **Afastamento Geral**: Colaboradores em licença maternidade, auxílio doença, ou qualquer outro tipo de afastamento geral também devem ser removidos, conforme especificado.
-
-### Exemplo de Implementação em Python
-
-Supondo que a base de dados esteja em um formato JSON e que tenhamos as listas de exclusão, aqui está um exemplo simplificado de como o processo poderia ser implementado:
+**Exemplo de Implementação em Python** (considerando que tenhamos os dados e as listas de exclusão):
 
 ```python
-import json
 import pandas as pd
+import json
 
-# Carregar base de dados
-def carregar_base_de_dados(arquivo_json):
-    with open(arquivo_json, 'r') as arquivo:
-        dados = json.load(arquivo)
+# Carregar dados
+def carregar_dados(arquivo_json):
+    with open(arquivo_json, 'r') as f:
+        dados = json.load(f)
     return pd.DataFrame(dados)
 
-# Identificar inelegíveis
-def identificar_inelegiveis(df, lista_estagio, lista_aprendiz, lista_exterior):
-    inelegiveis = lista_estagio + lista_aprendiz + lista_exterior
-    return inelegiveis
-
-# Filtrar por cargo
-def filtrar_por_cargo(df):
-    df_filtrado = df[~df['cargo'].str.contains('DIRETOR', case=False, na=False)]
-    df_filtrado = df_filtrado[~df_filtrado['cargo'].isin(['ESTAGIARIO', 'APRENDIZ'])]
-    return df_filtrado
-
-# Aplicar exclusões
-def aplicar_exclusoes(df, inelegiveis):
-    df_filtrado = df[~df['matricula'].isin(inelegiveis)]
-    return df_filtrado
+# Identificar e remover inelegíveis
+def remover_inelegiveis(df, lista_estagio, lista_aprendiz, lista_exterior, lista_diretores):
+    # Remover estagiários e aprendizes
+    df = df[~df['cargo'].str.upper().isin(['ESTAGIARIO', 'APRENDIZ'])]
+    
+    # Remover diretores
+    df = df[~df['cargo'].str.contains('DIRETOR', case=False, na=False)]
+    
+    # Remover colaboradores em afastamento geral
+    df = df[~df['situacao'].isin(['Licença Maternidade', 'Auxílio Doença'])]
+    
+    # Remover colaboradores listados nas listas de exclusão
+    df = df[~df['matricula'].isin(lista_estagio + lista_aprendiz + lista_exterior)]
+    
+    return df
 
 # Relatar ações
-def relatar_acoes(df_original, df_filtrado, inelegiveis):
-    print(f"Total de colaboradores recebidos: {len(df_original)}")
-    print(f"Total de colaboradores removidos: {len(inelegiveis)}")
+def relatar_acoes(df_original, df_filtrado):
+    total_colaboradores = len(df_original)
+    total_removidos = len(df_original) - len(df_filtrado)
+    print(f"Total de colaboradores recebidos: {total_colaboradores}")
+    print(f"Total de colaboradores removidos: {total_removidos}")
     print(f"Total de colaboradores elegíveis: {len(df_filtrado)}")
 
 # Entregar resultado
 def entregar_resultado(df_filtrado):
     resultado_json = df_filtrado.to_json(orient='records')
-    return resultado_json
+    return json.loads(resultado_json)
 
 # Exemplo de uso
-if __name__ == "__main__":
-    # Suponha que tenhamos as seguintes listas de exclusão
-    lista_estagio = ['matrícula1', 'matrícula2']
-    lista_aprendiz = ['matrícula3', 'matrícula4']
-    lista_exterior = ['matrícula5', 'matrícula6']
-    
-    # Carregar base de dados
-    df = carregar_base_de_dados('base_de_dados.json')
-    
-    # Identificar inelegíveis
-    inelegiveis = identificar_inelegiveis(df, lista_estagio, lista_aprendiz, lista_exterior)
-    
-    # Filtrar por cargo
-    df_filtrado_cargo = filtrar_por_cargo(df)
-    
-    # Aplicar exclusões
-    df_filtrado = aplicar_exclusoes(df_filtrado_cargo, inelegiveis)
-    
-    # Relatar ações
-    relatar_acoes(df, df_filtrado, inelegiveis)
-    
-    # Entregar resultado
-    resultado_json = entregar_resultado(df_filtrado)
-    print(resultado_json)
+arquivo_json = 'colaboradores.json'
+df = carregar_dados(arquivo_json)
+lista_estagio = [...]  # Lista de matrículas de estagiários
+lista_aprendiz = [...]  # Lista de matrículas de aprendizes
+lista_exterior = [...]  # Lista de matrículas de colaboradores exterior
+lista_diretores = [...]  # Lista de matrículas de diretores
+
+df_filtrado = remover_inelegiveis(df, lista_estagio, lista_aprendiz, lista_exterior, lista_diretores)
+relatar_acoes(df, df_filtrado)
+resultado = entregar_resultado(df_filtrado)
+print(resultado)
 ```
 
-Este exemplo simplificado ilustra os passos necessários para filtrar a base de dados com base nas regras de elegibilidade fornecidas. No entanto, para uma implementação real, seria necessário adaptar o código às especificidades da base de dados e às listas de exclusão fornecidas. Além disso, o tratamento de colaboradores em afastamento geral, como licença maternidade ou auxílio doença, deve ser incorporado ao processo de filtragem.
+Este exemplo ilustra os passos gerais para a implementação, mas é crucial ter acesso aos dados reais e às listas de exclusão para uma implementação precisa. Além disso, a implementação real deve considerar a estrutura exata dos dados e as especificações detalhadas das regras de exclusão.

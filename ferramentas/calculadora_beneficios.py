@@ -9,7 +9,8 @@ import unicodedata
 import os
 import numpy as np
 from pathlib import Path
-from utils.calendario import dias_uteis_periodo
+from utils.calendario import dias_uteis_periodo, preparar_feriados_para_ano
+from utils.config import DIAS_FIXOS_UF, VALOR_PADRAO
 from utils.regras_resolver import resolve_cct_rules
 
 # Base paths
@@ -452,9 +453,11 @@ def _find_col(cols, keys):
 @tool("calcular_financeiro_vr")
 def calcular_financeiro_vr(mes_referencia: str = "2025-05") -> str:
     """
-    Consolida dados em dados_entrada/, aplica regras (exclusões, férias, afastamentos, admissão/desligamento, comunicado<=15),
-    resolve valor VR (CCT/sindicato/estado) e gera planilha final em relatorios_saida/VR_MENSAL_XX_YYYY_CALC.xlsx.
-    Retorna um JSON com {"saida_xlsx": <path>, "linhas": N, "total_empresa": ..., "total_profissional": ...}
+    Consolida dados em dados_entrada/, aplica regras e gera planilha final para VR, VA ou Consolidado.
+    Formatos aceitos:
+      - "YYYY-MM" (default VR)
+      - "YYYY-MM|VR" | "YYYY-MM|VA" | "YYYY-MM|CONSOLIDADO"
+    Retorna JSON com caminhos e métricas.
     """
     base = Path(__file__).resolve().parent.parent
     dados = base / "dados_entrada"
@@ -513,8 +516,18 @@ def calcular_financeiro_vr(mes_referencia: str = "2025-05") -> str:
     if id_ativos is None or ativos.empty:
         return json.dumps({"erro":"Base ATIVOS não encontrada ou vazia"})
 
-    # competência
-    y, m = map(int, mes_referencia.split("-"))
+    # competência e produto
+    prod = "VR"
+    mr = (mes_referencia or "").strip()
+    if "|" in mr:
+        mes_ref, prod_in = mr.split("|", 1)
+        prod = (prod_in or "VR").strip().upper()
+    else:
+        mes_ref = mr
+    if prod not in {"VR","VA","CONSOLIDADO"}:
+        prod = "VR"
+
+    y, m = map(int, mes_ref.split("-"))
     ini_mes = date(y, m, 1)
     fim_mes = (date(y + (m//12), ((m%12)+1), 1) - timedelta(days=1))
 
@@ -585,13 +598,30 @@ def calcular_financeiro_vr(mes_referencia: str = "2025-05") -> str:
     work.columns = ["matricula"] + (["nome"] if nome_col else []) + (["sindicato"] if sind_col else [])
     work["matricula"] = work["matricula"].astype(str)
 
-    # exclusões
+    # exclusões por listas dedicadas (aprendiz/estágio/exterior)
     ids_ap = set(map(str, (aprendiz[_idcol(aprendiz)] if not aprendiz.empty else [])))
     ids_es = set(map(str, (estagio[_idcol(estagio)] if not estagio.empty else [])))
     ids_ex = set(map(str, (exterior[_idcol(exterior)] if not exterior.empty else [])))
     work = work[~work["matricula"].isin(ids_ap | ids_es | ids_ex)].copy()
 
-    # dias uteis base
+    # exclusões heurísticas por conteúdo do Ativos (diretor/estagiário/aprendiz/afastado/exterior)
+    try:
+        excl_ids_heur: set[str] = set()
+        for _, r in ativos.iterrows():
+            mid = str(r[id_ativos])
+            if mid in ids_ap or mid in ids_es or mid in ids_ex:
+                continue
+            try:
+                if _should_exclude(r):
+                    excl_ids_heur.add(mid)
+            except Exception:
+                pass
+        if excl_ids_heur:
+            work = work[~work["matricula"].isin(excl_ids_heur)].copy()
+    except Exception:
+        pass
+
+    # dias uteis base (fornecidos) — opcional
     def _map_du(df, val_hints):
         out = {}
         if df is None or df.empty: return out
@@ -608,8 +638,17 @@ def calcular_financeiro_vr(mes_referencia: str = "2025-05") -> str:
     du_colab = _map_du(diasut, ["dias_uteis_mes_colaborador","dias_uteis_colaborador","dias_uteis"])
     du_sind  = _map_du(diasut, ["dias_uteis_sindicato_mes","dias_uteis_sindicato","dias_sindicato","dias_uteis_mes"])
 
-    # fallback Mon-Fri do mês
-    month_business_days = len(pd.bdate_range(ini_mes, fim_mes))
+    # Preparar feriados automaticamente para UFs detectadas dos sindicatos
+    try:
+        ufs_detectadas = set()
+        if "sindicato" in work.columns:
+            for s in work["sindicato"].dropna().astype(str).tolist():
+                uf_i = _extract_uf_from_sindicato(s)
+                if uf_i:
+                    ufs_detectadas.add(uf_i)
+        preparar_feriados_para_ano(y, sorted(list(ufs_detectadas)))
+    except Exception:
+        pass
 
     # valor por estado
     if not vr_est.empty:
@@ -620,6 +659,9 @@ def calcular_financeiro_vr(mes_referencia: str = "2025-05") -> str:
         vr_est = pd.DataFrame(columns=["estado_norm","valor"])
 
     records = []
+    pendencias_regras: List[Dict[str, Any]] = []
+    # Modo de base de valores: CCT (padrão) ou MANUAL (planilha/VALOR_PADRAO)
+    base_mode = os.getenv("VRVA_VAL_BASE", "CCT").upper()
     for _, r in work.iterrows():
         mid = r["matricula"]
         sind = r.get("sindicato","NA")
@@ -639,52 +681,199 @@ def calcular_financeiro_vr(mes_referencia: str = "2025-05") -> str:
             if dc and dc.year == y and dc.month == m and dc.day <= 15:
                 zerar = True
 
+        # UF inferida do sindicato (para feriados e regras)
+        uf = _extract_uf_from_sindicato(sind) if isinstance(sind, str) else None
+
+        # dias úteis do mês para essa UF
+        try:
+            month_business_days = dias_uteis_periodo(ini_mes, fim_mes, uf, None)
+        except Exception:
+            month_business_days = len(pd.bdate_range(ini_mes, fim_mes))
+        # aplicar dias fixos por UF, se parametrizado
+        base_days_mes = DIAS_FIXOS_UF.get(uf, month_business_days) if uf else month_business_days
+
         if w_end < w_start or zerar:
             dias_pagos = 0
         else:
-            dias_trab = len(pd.bdate_range(w_start, w_end))
+            # dias úteis trabalháveis no intervalo, considerando feriados por UF
+            try:
+                dias_trab = dias_uteis_periodo(w_start, w_end, uf, None)
+            except Exception:
+                dias_trab = len(pd.bdate_range(w_start, w_end))
             # descontar ferias
             df_fer = 0
             if mid in fer_int:
                 for (s,e) in fer_int[mid]:
                     s2 = max(w_start, s); e2 = min(w_end, e)
-                    if e2 >= s2: df_fer += len(pd.bdate_range(s2, e2))
+                    if e2 >= s2:
+                        try:
+                            df_fer += dias_uteis_periodo(s2, e2, uf, None)
+                        except Exception:
+                            df_fer += len(pd.bdate_range(s2, e2))
             # afast
             df_af = 0
             if mid in afa_int:
                 for (s,e) in afa_int[mid]:
                     s2 = max(w_start, s); e2 = min(w_end, e)
-                    if e2 >= s2: df_af += len(pd.bdate_range(s2, e2))
+                    if e2 >= s2:
+                        try:
+                            df_af += dias_uteis_periodo(s2, e2, uf, None)
+                        except Exception:
+                            df_af += len(pd.bdate_range(s2, e2))
             dias_liq = max(0, dias_trab - df_fer - df_af)
-            dias_mes_sind = du_sind.get(mid, month_business_days)
+            # se houver base específica por colaborador/sindicato, usa; senão, aplica dias fixos por UF quando disponível
+            dias_mes_sind = du_sind.get(mid, DIAS_FIXOS_UF.get(uf, month_business_days) if uf else month_business_days)
             dias_base_col = du_colab.get(mid, dias_mes_sind)
-            prop = dias_liq / month_business_days if month_business_days>0 else 0
+            # proporcionalidade baseada no total de dias-base do mês (fixo por UF quando definido)
+            prop = dias_liq / base_days_mes if base_days_mes > 0 else 0
             dias_pagos = int(round(prop * dias_mes_sind))
             dias_pagos = max(0, min(dias_pagos, dias_base_col, dias_mes_sind))
 
-        # valor por estado
-        uf = _extract_uf_from_sindicato(sind) if isinstance(sind, str) else None
+        # valor por CCT (prioritário) com fallback por estado
         est = UF_MAP.get(uf) if uf else None
         estado_norm = str(est).strip().lower() if est else None
-        valor_dia = np.nan
-        origem = "NA"
-        if estado_norm and not vr_est.empty:
-            rowm = vr_est[vr_est["estado_norm"] == estado_norm]
-            if not rowm.empty:
-                valor_dia = float(rowm.iloc[0][vv_col])
-                origem = "ESTADO"
+        valor_dia_vr = np.nan
+        valor_dia_va = np.nan
+        origem_vr = "NA"
+        origem_va = "NA"
 
-        total = 0.0 if np.isnan(valor_dia) else round(dias_pagos * valor_dia, 2)
-        empresa = round(total * 0.80, 2)
-        prof = round(total * 0.20, 2)
+        # 1) Regras por CCT (opcional conforme base_mode)
+        regra = {}
+        vr_diario_cct: Optional[float] = None
+        va_diario_cct: Optional[float] = None
+        if base_mode != "MANUAL":
+            regra = resolve_cct_rules(uf=uf or "", sindicato=sind if isinstance(sind,str) else "")
+            try:
+                rv = regra.get("vr_valor") if isinstance(regra, dict) else None
+                ra = regra.get("va_valor") if isinstance(regra, dict) else None
+                per = (regra.get("periodicidade") or "dia") if isinstance(regra, dict) else "dia"
+                dias_regra = regra.get("dias") if isinstance(regra, dict) else None
+                if rv:
+                    v = float(str(rv).replace("R$", "").replace(" ", "").replace(".", "").replace(",", "."))
+                    if str(per).lower().startswith("mes") and dias_regra:
+                        vr_diario_cct = round(v / max(int(dias_regra), 1), 2)
+                    else:
+                        vr_diario_cct = round(v, 2)
+                if ra:
+                    a = float(str(ra).replace("R$", "").replace(" ", "").replace(".", "").replace(",", "."))
+                    if str(per).lower().startswith("mes") and dias_regra:
+                        va_diario_cct = round(a / max(int(dias_regra), 1), 2)
+                    else:
+                        va_diario_cct = round(a, 2)
+            except Exception:
+                vr_diario_cct = None
+                va_diario_cct = None
+
+        # VR com fallback por estado e, por fim, VALOR_PADRAO
+        if vr_diario_cct is not None:
+            valor_dia_vr = float(vr_diario_cct)
+            origem_vr = f"CCT::{regra.get('origem','desconhecido')}"
+        else:
+            if estado_norm and not vr_est.empty:
+                rowm = vr_est[vr_est["estado_norm"] == estado_norm]
+                if not rowm.empty:
+                    try:
+                        valor_dia_vr = float(rowm.iloc[0][vv_col])
+                        origem_vr = "ESTADO"
+                    except Exception:
+                        valor_dia_vr = np.nan
+            # fallback final: VALOR_PADRAO por UF ou sindicato
+            if isinstance(valor_dia_vr, float) and np.isnan(valor_dia_vr):
+                # por UF
+                if uf and uf in VALOR_PADRAO and isinstance(VALOR_PADRAO[uf], dict):
+                    vr_pad = VALOR_PADRAO[uf].get("VR") or VALOR_PADRAO[uf].get("vr")
+                    if vr_pad is not None:
+                        try:
+                            valor_dia_vr = float(vr_pad)
+                            origem_vr = "VALOR_PADRAO::UF"
+                        except Exception:
+                            pass
+                # por sindicato (chave conforme fornecida no config)
+                if isinstance(valor_dia_vr, float) and np.isnan(valor_dia_vr) and isinstance(sind, str) and sind in VALOR_PADRAO:
+                    vr_pad = VALOR_PADRAO[sind].get("VR") or VALOR_PADRAO[sind].get("vr")
+                    if vr_pad is not None:
+                        try:
+                            valor_dia_vr = float(vr_pad)
+                            origem_vr = "VALOR_PADRAO::SINDICATO"
+                        except Exception:
+                            pass
+            if isinstance(valor_dia_vr, float) and np.isnan(valor_dia_vr):
+                pendencias_regras.append({
+                    "matricula": mid,
+                    "nome": r.get("nome",""),
+                    "uf": uf,
+                    "sindicato": sind,
+                    "motivo": "Sem regra CCT e sem valor por estado (VR)",
+                })
+
+        # VA por CCT e, por fim, VALOR_PADRAO (sem fallback estadual)
+        if va_diario_cct is not None:
+            valor_dia_va = float(va_diario_cct)
+            origem_va = f"CCT::{regra.get('origem','desconhecido')}"
+        else:
+            if prod in {"VA","CONSOLIDADO"}:
+                # fallback final por UF/sindicato se parametrizado
+                if uf and uf in VALOR_PADRAO and isinstance(VALOR_PADRAO[uf], dict):
+                    va_pad = VALOR_PADRAO[uf].get("VA") or VALOR_PADRAO[uf].get("va")
+                    if va_pad is not None:
+                        try:
+                            valor_dia_va = float(va_pad)
+                            origem_va = "VALOR_PADRAO::UF"
+                        except Exception:
+                            pass
+                if (isinstance(valor_dia_va, float) and np.isnan(valor_dia_va)) and isinstance(sind, str) and sind in VALOR_PADRAO:
+                    va_pad = VALOR_PADRAO[sind].get("VA") or VALOR_PADRAO[sind].get("va")
+                    if va_pad is not None:
+                        try:
+                            valor_dia_va = float(va_pad)
+                            origem_va = "VALOR_PADRAO::SINDICATO"
+                        except Exception:
+                            pass
+                # reporta pendência apenas quando base_mode usa CCT e VA não foi encontrada
+                if base_mode != "MANUAL":
+                    pendencias_regras.append({
+                        "matricula": mid,
+                        "nome": r.get("nome",""),
+                        "uf": uf,
+                        "sindicato": sind,
+                        "motivo": "Sem regra CCT para VA",
+                    })
+
+        total_vr = 0.0 if np.isnan(valor_dia_vr) else round(dias_pagos * float(valor_dia_vr), 2)
+        total_va = 0.0 if np.isnan(valor_dia_va) else round(dias_pagos * float(valor_dia_va), 2)
+        if prod == "VR":
+            valor_dia_sel = None if np.isnan(valor_dia_vr) else float(valor_dia_vr)
+            total_sel = total_vr
+            origem_sel = origem_vr
+            dias_sel = dias_pagos
+        elif prod == "VA":
+            valor_dia_sel = None if np.isnan(valor_dia_va) else float(valor_dia_va)
+            total_sel = total_va
+            origem_sel = origem_va
+            dias_sel = dias_pagos
+        else:  # CONSOLIDADO
+            vd = 0.0
+            if not np.isnan(valor_dia_vr): vd += float(valor_dia_vr)
+            if not np.isnan(valor_dia_va): vd += float(valor_dia_va)
+            valor_dia_sel = vd if vd>0 else None
+            total_sel = round(total_vr + total_va, 2)
+            origem_sel = "VR+VA"
+            dias_sel = dias_pagos
+
+        empresa = round(total_sel * 0.80, 2)
+        prof = round(total_sel * 0.20, 2)
         obs = []
         if zerar: obs.append("COMUNICADO<=15")
-        records.append([mid, r.get("nome",""), sind, uf, mes_referencia, None if np.isnan(valor_dia) else valor_dia, dias_pagos, total, empresa, prof, ";".join(obs) if obs else "OK", origem])
+        records.append([
+            mid, r.get("nome",""), sind, uf, f"{y:04d}-{m:02d}",
+            valor_dia_sel, dias_sel, total_sel, empresa, prof,
+            ";".join(obs) if obs else "OK", origem_sel, prod
+        ])
 
     cols = [
         "matricula","nome","sindicato","uf_inferida","ano_mes",
-        "vr_valor_dia_aplicado","dias_vr_pagos","vr_total_colaborador",
-        "custo_empresa_80","desconto_profissional_20","observacoes","origem_valor"
+        "valor_dia","dias_pagos","total_colaborador",
+        "custo_empresa_80","desconto_profissional_20","observacoes","origem_valor","produto"
     ]
     df_out = pd.DataFrame(records, columns=cols)
 
@@ -702,14 +891,19 @@ def calcular_financeiro_vr(mes_referencia: str = "2025-05") -> str:
         # Competência mm/aaaa
         df_out["competencia_fmt"] = f"{m:02d}/{y}"
         # Seleção e renomeação
+        rot_valor = {
+            "VR": "VALOR DIÁRIO VR",
+            "VA": "VALOR DIÁRIO VA",
+            "CONSOLIDADO": "VALOR DIÁRIO",
+        }[prod]
         export_cols = [
             ("matricula_num", "Matricula"),
             ("admissao_fmt", "Admissão"),
             ("sindicato", "Sindicato do Colaborador"),
             ("competencia_fmt", "Competência"),
-            ("dias_vr_pagos", "Dias"),
-            ("vr_valor_dia_aplicado", "VALOR DIÁRIO VR"),
-            ("vr_total_colaborador", "TOTAL"),
+            ("dias_pagos", "Dias"),
+            ("valor_dia", rot_valor),
+            ("total_colaborador", "TOTAL"),
             ("custo_empresa_80", "Custo empresa"),
             ("desconto_profissional_20", "Desconto profissional"),
         ]
@@ -719,13 +913,15 @@ def calcular_financeiro_vr(mes_referencia: str = "2025-05") -> str:
         # fallback: mantém layout antigo se algo falhar
         df_exp = df_out.copy()
 
-    out_path = str(saida_dir / f"VR_MENSAL_{m:02d}_{y}_CALC.xlsx")
+    prefix = "VR_MENSAL" if prod=="VR" else ("VA_MENSAL" if prod=="VA" else "BENEFICIOS_MENSAL_CONSOLIDADO")
+    sheet = "VR_MENSAL" if prod=="VR" else ("VA_MENSAL" if prod=="VA" else "BENEFICIOS")
+    out_path = str(saida_dir / f"{prefix}_{m:02d}_{y}_CALC.xlsx")
     with pd.ExcelWriter(out_path, engine="openpyxl") as w:
-        df_exp.to_excel(w, sheet_name="VR_MENSAL", index=False)
+        df_exp.to_excel(w, sheet_name=sheet, index=False)
 
     # Sanity checks e export de erros
     try:
-        assert float(df_out["vr_total_colaborador"].sum()) > 0, "Total geral deu 0 — verifique merge de valor (estado/sindicato) e comunicado<=15."
+        assert float(df_out["total_colaborador"].sum()) > 0, "Total geral deu 0 — verifique merge de valor (CCT/estado) e comunicado<=15."
     except AssertionError as e:
         print(str(e))
 
@@ -746,35 +942,54 @@ def calcular_financeiro_vr(mes_referencia: str = "2025-05") -> str:
     except Exception:
         pass
     try:
-        sem_valor_count = int((df_out["vr_valor_dia_aplicado"].isna()).sum())
-        print("Sem valor sindicato/estado:", sem_valor_count)
+        sem_valor_count = int((df_out["valor_dia"].isna()).sum())
+        print("Sem valor aplicado:", sem_valor_count)
     except Exception:
         pass
 
     # Gera arquivo de casos de erro (sem valor aplicado)
     err_path = None
     try:
-        errs = df_out[df_out["vr_valor_dia_aplicado"].isna()].copy()
+        errs = df_out[df_out["valor_dia"].isna()].copy()
         if not errs.empty:
             def _motivo(row):
                 if not row.get("uf_inferida"):
                     return "UF não reconhecida no sindicato"
-                return "Estado sem valor na planilha Base sindicato x valor.xlsx"
+                if prod == "VR":
+                    return "Estado/sindicato sem valor VR"
+                elif prod == "VA":
+                    return "Sindicato sem valor VA"
+                else:
+                    return "Sem VR/VA definidos"
             errs["motivo_erro"] = errs.apply(_motivo, axis=1)
-            err_path = str(saida_dir / f"VR_MENSAL_{m:02d}_{y}_ERROS.csv")
+            eprefix = "VR" if prod=="VR" else ("VA" if prod=="VA" else "VRVA")
+            err_path = str(saida_dir / f"{eprefix}_MENSAL_{m:02d}_{y}_ERROS.csv")
             errs[["matricula","nome","sindicato","uf_inferida","ano_mes","motivo_erro"]].to_csv(err_path, index=False, encoding="utf-8")
+    except Exception:
+        pass
+
+    # Gera arquivo de pendências de CCT (para validação manual/override)
+    pend_path = None
+    try:
+        if pendencias_regras:
+            dfp = pd.DataFrame(pendencias_regras)
+            dfp = dfp.drop_duplicates(subset=["uf","sindicato"])  # 1 por combinação
+            pfx = "VRVA" if prod=="CONSOLIDADO" else prod
+            pend_path = str(saida_dir / f"{pfx}_CCT_PENDENCIAS_{m:02d}_{y}.csv")
+            dfp.to_csv(pend_path, index=False, encoding="utf-8")
     except Exception:
         pass
 
     return json.dumps({
         "saida_xlsx": out_path,
+        "produto": prod,
         "linhas": len(df_out),
         "total_empresa": float(df_out["custo_empresa_80"].sum()),
         "total_profissional": float(df_out["desconto_profissional_20"].sum()),
-        "total_geral": float(df_out["vr_total_colaborador"].sum()),
-        # Metricas de validação para UI
+        "total_geral": float(df_out["total_colaborador"].sum()),
         "origem_valor_counts": origem_counts,
         "zerados_por_comunicado": zerados_por_comunicado,
         "sem_valor_count": sem_valor_count,
         "erros_csv": err_path,
+        "pendencias_cct_csv": pend_path,
     })
