@@ -1,0 +1,55 @@
+[
+  {
+    "arquivo": "CCT -2024-2025 SP.pdf",
+    "uf": "SP",
+    "sindicato": "SINDICATO DOS EMPREGADOS EM EMPRESAS DE PROCESSAMENTO DE DADOS, SERV COMP,",
+    "periodicidade": "mensal",
+    "condicao": null,
+    "tem_clausula_vr": false,
+    "tem_clausula_va": false,
+    "origem": "docling_text"
+  },
+  {
+    "arquivo": "CCT-2023-2025-HOMOLOGADA- RJ.pdf",
+    "uf": "RJ",
+    "sindicato": "SINDICATO DAS EMPRESAS DE INFORMATICA DO ESTADO DO RIO DE JANEIRO, CNPJ N.",
+    "dias": 30,
+    "periodicidade": "mensal",
+    "condicao": null,
+    "tem_clausula_vr": true,
+    "tem_clausula_va": true,
+    "vr_valor": "1",
+    "va_valor": "1",
+    "origem": "docling_text",
+    "vr_float": 1.0,
+    "va_float": 1.0
+  },
+  {
+    "arquivo": "CCT-2024_2025-Mediador-Extrato-Convencao-Coletiva-RS.pdf",
+    "uf": "RS",
+    "sindicato": "SINDICATO DOS TRABALHADORES EM PROCESSAMENTO DE DADOS NO EST, CNPJ N.",
+    "va_valor": "01",
+    "periodicidade": "diário",
+    "condicao": null,
+    "tem_clausula_vr": false,
+    "tem_clausula_va": true,
+    "origem": "docling_text",
+    "va_float": 1.0
+  },
+  {
+    "arquivo": "cct-parana-2025-2026-publicado-no-sitema-mediador-mte.pdf",
+    "uf": "PR",
+    "sindicato": "SINDICATO EMPR PROC DADOS E SERV TEC INFORM EST PARANA, CNPJ N. 81.105.157/0001-83, NESTE ATO",
+    "va_valor": "81",
+    "dias": 22,
+    "periodicidade": "diário",
+    "condicao": null,
+    "va_estimado_mes": 616.0,
+    "tem_clausula_vr": true,
+    "tem_clausula_va": true,
+    "vr_valor": "15",
+    "origem": "docling_text",
+    "vr_float": 15.0,
+    "va_float": 81.0
+  }
+]

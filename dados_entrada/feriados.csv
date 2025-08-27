@@ -1,6 +1,14 @@
 data,uf,municipio,descricao
-2025-01-01,,,"Confraternização Universal (Nacional)"
-2025-04-18,,,"Sexta-feira Santa (Nacional)"
-2025-04-21,,,"Tiradentes (Nacional)"
-2025-05-01,,,"Dia do Trabalhador (Nacional)"
-2025-06-19,SP,SAO PAULO,"Corpus Christi (Municipal - exemplo)"
+2025-01-01,NAN,NAN,Confraternização Universal (Nacional)
+2025-04-18,NAN,NAN,Sexta-feira Santa (Nacional)
+2025-04-21,NAN,NAN,Tiradentes (Nacional)
+2025-05-01,NAN,NAN,Dia do Trabalhador (Nacional)
+2025-06-19,SP,SAO PAULO,Corpus Christi (Municipal - exemplo)
+2025-10-12,NAN,NAN,
+2025-11-15,NAN,NAN,
+2025-11-20,NAN,NAN,
+2025-12-25,NAN,NAN,
+2025-10-12,,,
+2025-11-15,,,
+2025-11-20,,,
+2025-12-25,,,
