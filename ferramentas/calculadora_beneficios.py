@@ -10,9 +10,8 @@ import os
 import numpy as np
 from pathlib import Path
 from utils.calendario import dias_uteis_periodo, preparar_feriados_para_ano
-from utils.config import DIAS_FIXOS_UF, VALOR_PADRAO
+from utils.config import DIAS_FIXOS_UF, VALOR_PADRAO, get_competencia
 from utils.regras_resolver import resolve_cct_rules
-
 # Base paths
 BASE_DIR = Path(__file__).resolve().parent.parent
 DADOS_DIR = BASE_DIR / "dados_entrada"
@@ -48,9 +47,32 @@ def _daterange(start: date, end: date):
 
 def _parse_mes_ref(mes_referencia: str) -> Tuple[date, date]:
     """
-    Converte 'YYYY-MM' em (data_inicial, data_final) do mês.
+    Converte 'YYYY-MM' em (data_inicial, data_final) da competência.
+    Se houver configuração persistida (get_competencia), usa a janela:
+      [start_day_prev do mês anterior, end_day_ref do mês de referência]
+    com validação de dias existentes por mês.
     """
+    import calendar as _cal
     y, m = map(int, mes_referencia.split("-"))
+    cfg = get_competencia() or {}
+    cy, cm = cfg.get("year"), cfg.get("month")
+    sdp, edr = cfg.get("start_day_prev"), cfg.get("end_day_ref")
+    # Usa cfg se ano/mês batem com mes_referencia
+    if cy and cm and int(cy) == y and int(cm) == m and sdp and edr:
+        # mês anterior
+        if m == 1:
+            py, pm = y - 1, 12
+        else:
+            py, pm = y, m - 1
+        # clamp dias
+        sdp = max(1, min(31, int(sdp)))
+        edr = max(1, min(31, int(edr)))
+        sdp = min(sdp, _cal.monthrange(py, pm)[1])
+        edr = min(edr, _cal.monthrange(y, m)[1])
+        ini = date(py, pm, sdp)
+        fim = date(y, m, edr)
+        return ini, fim
+    # fallback padrão: mês civil
     ini = date(y, m, 1)
     if m == 12:
         fim = date(y + 1, 1, 1) - timedelta(days=1)
@@ -534,7 +556,7 @@ def calcular_financeiro_vr(mes_referencia: str = "2025-05") -> str:
     # mapas auxiliares
     def _intervalos(df, start_hints, end_hints, id_col):
         out = {}
-        if df is None or df.empty or not id_col: return out
+        if df is None or df.empty: return out
         sc = _find_col(df.columns, start_hints)
         ec = _find_col(df.columns, end_hints)
         if not sc or not ec: return out
@@ -621,7 +643,90 @@ def calcular_financeiro_vr(mes_referencia: str = "2025-05") -> str:
     except Exception:
         pass
 
-    # dias uteis base (fornecidos) — opcional
+    # Inclusão de "somente Admissões e coluna D vazia" como ativos (regra de negócio)
+    try:
+        if admis is not None and not admis.empty and len(admis.columns) >= 4:
+            # IDs presentes em outras bases (para garantir que são "somente admissão")
+            ids_outros: set[str] = set()
+            def _ids(df: pd.DataFrame) -> set[str]:
+                try:
+                    if df is None or df.empty:
+                        return set()
+                    return set(map(str, df[df.columns[0]].astype(str).tolist()))
+                except Exception:
+                    return set()
+            try:
+                ids_outros |= _ids(ativos)
+            except Exception:
+                pass
+            for _df in (aprendiz, estagio, exterior, ferias, afast, deslig):
+                try:
+                    ids_outros |= _ids(_df)
+                except Exception:
+                    pass
+            # IDs de Admissões e coluna D (quarta) vazia
+            id_adm_col = _idcol(admis)
+            col_d = admis.columns[3]
+            try:
+                s = admis[col_d].astype(str).str.strip().replace({"nan": "", "None": ""})
+            except Exception:
+                s = pd.Series(["" for _ in range(len(admis))])
+            ids_colD_blank = set(map(str, admis.loc[s == "", id_adm_col].astype(str).tolist()))
+            ids_adm = set(map(str, admis[id_adm_col].astype(str).tolist()))
+            only_in_adm = {mid for mid in ids_adm if mid not in ids_outros}
+            target_ids = only_in_adm & ids_colD_blank
+            if target_ids:
+                # Mapear possíveis colunas de nome e sindicato em Admissões
+                nome_adm_col = _find_col(admis.columns, ["nome","colaborador","funcionario"])  # já normalizadas
+                sind_adm_col = _find_col(admis.columns, ["sindicato","sind"])  # já normalizadas
+                uf_adm_col = _find_col(admis.columns, ["uf","estado","unidade_federativa"])  # já normalizadas
+                rows_add = []
+                for mid in sorted(target_ids):
+                    rec = {"matricula": mid}
+                    if nome_adm_col and nome_adm_col in admis.columns:
+                        try:
+                            val = admis.loc[admis[id_adm_col].astype(str) == mid, nome_adm_col].iloc[0]
+                            rec["nome"] = val
+                        except Exception:
+                            pass
+                    if sind_adm_col and sind_adm_col in admis.columns:
+                        try:
+                            val = admis.loc[admis[id_adm_col].astype(str) == mid, sind_adm_col].iloc[0]
+                            rec["sindicato"] = val
+                        except Exception:
+                            pass
+                    if uf_adm_col and uf_adm_col in admis.columns:
+                        try:
+                            raw = str(admis.loc[admis[id_adm_col].astype(str) == mid, uf_adm_col].iloc[0])
+                            raw_u = raw.strip().upper()
+                            if len(raw_u) == 2:
+                                rec["UF"] = raw_u
+                            else:
+                                rev_map = {v.lower(): k for k, v in UF_MAP.items()}
+                                rec["UF"] = rev_map.get(raw.strip().lower())
+                        except Exception:
+                            pass
+                    # Default UF for admissions-only if still missing
+                    if not rec.get("UF"):
+                        rec["UF"] = "RS"
+                    rows_add.append(rec)
+                if rows_add:
+                    df_add = pd.DataFrame(rows_add)
+                    # garantir colunas esperadas
+                    for c in ("nome","sindicato","UF"):
+                        if c not in df_add.columns and c in work.columns:
+                            df_add[c] = None
+                    # alinhar colunas ao work (adiciona UF se não existir)
+                    for c in df_add.columns:
+                        if c not in work.columns:
+                            work[c] = None
+                    work = pd.concat([work, df_add[work.columns]], ignore_index=True)
+                    # remover duplicatas por matricula, priorizando já existentes na base de Ativos
+                    work = work.drop_duplicates(subset=["matricula"], keep="first")
+    except Exception:
+        pass
+
+    # dias úteis base (fornecidos) — opcional
     def _map_du(df, val_hints):
         out = {}
         if df is None or df.empty: return out
@@ -681,6 +786,17 @@ def calcular_financeiro_vr(mes_referencia: str = "2025-05") -> str:
             if dc and dc.year == y and dc.month == m and dc.day <= 15:
                 zerar = True
 
+        # Desligado SEM OK e admitido dentro do mês de referência: limitar janela até dia 15
+        try:
+            if (not zerar) and info and (not info.get("status") or "OK" not in str(info.get("status"))):
+                adm_d = adm_map.get(mid)
+                if adm_d and adm_d.year == y and adm_d.month == m:
+                    limit_15 = date(y, m, 15)
+                    if w_end > limit_15:
+                        w_end = limit_15
+        except Exception:
+            pass
+
         # UF inferida do sindicato (para feriados e regras)
         uf = _extract_uf_from_sindicato(sind) if isinstance(sind, str) else None
 
@@ -689,8 +805,9 @@ def calcular_financeiro_vr(mes_referencia: str = "2025-05") -> str:
             month_business_days = dias_uteis_periodo(ini_mes, fim_mes, uf, None)
         except Exception:
             month_business_days = len(pd.bdate_range(ini_mes, fim_mes))
-        # aplicar dias fixos por UF, se parametrizado
-        base_days_mes = DIAS_FIXOS_UF.get(uf, month_business_days) if uf else month_business_days
+        # aplicar dias base do mês: usar arquivo de dias úteis quando disponível; evitar DIAS_FIXOS se possível
+        # base_days_mes só é usado para proporcionalidade/cap; como usamos dias_liq diretamente, mantemos como month_business_days
+        base_days_mes = month_business_days
 
         if w_end < w_start or zerar:
             dias_pagos = 0
@@ -710,6 +827,23 @@ def calcular_financeiro_vr(mes_referencia: str = "2025-05") -> str:
                             df_fer += dias_uteis_periodo(s2, e2, uf, None)
                         except Exception:
                             df_fer += len(pd.bdate_range(s2, e2))
+            # férias sintéticas: quando só houver quantidade de dias em FÉRIAS
+            try:
+                if (mid not in fer_int or not fer_int[mid]) and ferias is not None and not ferias.empty:
+                    # procurar colunas candidatas de "dias"
+                    cand_cols = [c for c in ferias.columns if any(k in str(c).lower() for k in ["dias","qtd"]) ]
+                    if cand_cols:
+                        idc = ferias.columns[0]
+                        rows_mid = ferias[ferias[idc].astype(str) == mid]
+                        if not rows_mid.empty:
+                            try:
+                                n = int(float(rows_mid.iloc[0][cand_cols[0]]))
+                                # subtrai N dias úteis sintéticos (a partir do início da janela efetiva w_start)
+                                df_fer += max(0, min(n, dias_trab))
+                            except Exception:
+                                pass
+            except Exception:
+                pass
             # afast
             df_af = 0
             if mid in afa_int:
@@ -721,14 +855,11 @@ def calcular_financeiro_vr(mes_referencia: str = "2025-05") -> str:
                         except Exception:
                             df_af += len(pd.bdate_range(s2, e2))
             dias_liq = max(0, dias_trab - df_fer - df_af)
-            # se houver base específica por colaborador/sindicato, usa; senão, aplica dias fixos por UF quando disponível
-            dias_mes_sind = du_sind.get(mid, DIAS_FIXOS_UF.get(uf, month_business_days) if uf else month_business_days)
+            # dias_mes_sind usa mapas (preferir base fornecida). Evitar DIAS_FIXOS_UF (use business_days se ausente)
+            dias_mes_sind = du_sind.get(mid, month_business_days)
             dias_base_col = du_colab.get(mid, dias_mes_sind)
-            # proporcionalidade baseada no total de dias-base do mês (fixo por UF quando definido)
-            prop = dias_liq / base_days_mes if base_days_mes > 0 else 0
-            dias_pagos = int(round(prop * dias_mes_sind))
-            dias_pagos = max(0, min(dias_pagos, dias_base_col, dias_mes_sind))
-
+            # usar dias líquidos diretamente, apenas limitando aos máximos parametrizados
+            dias_pagos = max(0, min(int(dias_liq), int(dias_base_col), int(dias_mes_sind)))
         # valor por CCT (prioritário) com fallback por estado
         est = UF_MAP.get(uf) if uf else None
         estado_norm = str(est).strip().lower() if est else None

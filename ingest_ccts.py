@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 import io
 import re
+import hashlib
 
 import fitz  # PyMuPDF
 import chromadb
@@ -397,6 +398,7 @@ def main():
             """
             CREATE TABLE IF NOT EXISTS regras_cct (
                 arquivo TEXT PRIMARY KEY,
+                doc_sha1 TEXT,
                 uf TEXT,
                 sindicato TEXT,
                 vr TEXT,
@@ -415,10 +417,28 @@ def main():
             conn.execute("CREATE INDEX IF NOT EXISTS idx_regras_cct_arquivo ON regras_cct(arquivo);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_regras_cct_uf ON regras_cct(uf);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_regras_cct_sindicato ON regras_cct(sindicato);")
+            try:
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_regras_cct_uf_sind ON regras_cct(uf, sindicato);")
+            except Exception:
+                pass
+            # Migration: add column doc_sha1 if table existed without it
+            try:
+                cur = conn.execute("PRAGMA table_info(regras_cct)")
+                cols = [r[1] for r in cur.fetchall()]
+                if 'doc_sha1' not in cols:
+                    conn.execute("ALTER TABLE regras_cct ADD COLUMN doc_sha1 TEXT")
+            except Exception:
+                pass
     except Exception as e:
         print(f"Aviso: falha ao criar/indixar regras_cct: {e}. SQL=\n{create_sql}")
 
     for pdf in pdfs:
+        # Compute SHA1 of the PDF for deduplication
+        try:
+            data = pdf.read_bytes()
+            doc_sha1 = hashlib.sha1(data).hexdigest()
+        except Exception:
+            doc_sha1 = None
         # 0) Try Docling first for VR/VA (tables/text)
         docling_res: Dict[str, Optional[str]] = {
             "vr": None, "va": None, "vr_float": None, "va_float": None, "origem": None
@@ -537,11 +557,12 @@ def main():
                 conn.execute(
                     """
                     INSERT INTO regras_cct (
-                        arquivo, uf, sindicato, vr, vr_float, va, va_float, origem, periodicidade, condicao
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        arquivo, doc_sha1, uf, sindicato, vr, vr_float, va, va_float, origem, periodicidade, condicao
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         pdf.name,
+                        doc_sha1,
                         uf,
                         sindicato,
                         vr,

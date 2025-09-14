@@ -2,118 +2,355 @@
 
 Sistema multiagentes para cálculo de VR/VA orquestrado por um "Gerente" (orquestrador) e especialistas, com painel em Streamlit para operação e revisão.
 
+## Sumário
+
+- [Estrutura](#estrutura)
+- [Visão Geral (PT-BR)](#visão-geral-pt-br)
+  - [Arquitetura em alto nível](#arquitetura-em-alto-nível)
+  - [Agentes & Responsabilidades](#agentes--responsabilidades)
+  - [Regras determinísticas (resumo)](#regras-determinísticas-resumo)
+  - [Páginas do dashboard (como usar)](#páginas-do-dashboard-como-usar)
+  - [Prompts & LLM](#prompts--llm)
+  - [Embeddings & Índices Vetoriais](#embeddings--índices-vetoriais)
+  - [Setup](#setup)
+  - [Execução](#execução)
+  - [Guias rápidos](#guias-rápidos)
+  - [Troubleshooting](#troubleshooting)
+- [Project Overview (English)](#project-overview-english)
+  - [Architecture at a glance](#architecture-at-a-glance)
+  - [Agents & Responsibilities](#agents--responsibilities)
+  - [Deterministic Rules (summary)](#deterministic-rules-summary)
+  - [UI Pages (how to)](#ui-pages-how-to)
+  - [Prompts & LLM](#prompts--llm-1)
+  - [Embeddings & Indexes](#embeddings--indexes)
+  - [Setup](#setup-1)
+  - [Running](#running)
+  - [Quick Guides](#quick-guides)
+  - [Troubleshooting](#troubleshooting-1)
+
 ## Estrutura
 Pastas principais neste repositório:
 - `dados_entrada/`: arquivos base (Excel/CSV) enviados pelo usuário
 - `relatorios_saida/`: relatórios e artefatos gerados (XLSX/CSV/JSON)
 - `ferramentas/`: ferramentas de cálculo e utilitários (ex.: `calculadora_beneficios.py`)
-- `utils/`: helpers (calendário, carregamento de prompts, config)
-- `agentes/` e `prompts/`: definição dos agentes e prompts
 
-## Arquitetura do Sistema
-- __[Camada de Ingestão de CCTs]__ (`ingest_ccts.py`):
-  - Extrai texto e tabelas das CCTs com ordem de prioridade: Docling → PyMuPDF/pdfplumber → OCR (Tesseract).
-  - Resolve VR/VA, normaliza valores para float, detecta `periodicidade`/`condicao`, e persiste no SQLite.
-  - Indexa conteúdo em ChromaDB para buscas/contexto futuro.
-- __[Camada de Persistência]__ (`base_conhecimento/automacao_rh.db`, `ferramentas/persistencia_db.py`):
-  - Tabela `regras_cct` com colunas: `arquivo`, `uf`, `sindicato`, `vr`, `vr_float`, `va`, `va_float`, `origem`, `periodicidade`, `condicao`.
-  - Ferramentas utilitárias para salvar/carregar DataFrames via `@tool`.
-- __[Camada de Lógica/Negócio]__ (`ferramentas/*.py`):
-  - `calculadora_beneficios.py`: cálculos de VR mensal, etc.
-  - `gerador_relatorio.py`: composição dos relatórios finais.
-  - `extracao_cct_docling.py`: extração estruturada VR/VA + heurísticas.
-- __[Camada de Orquestração Multiagente]__ (`agentes/`, `prompts/`, `main.py`):
-  - Orquestra agentes especialistas (Dados, Coletor CCT, Analista CCT, Compliance, Cálculo) dirigidos por prompts.
-  - Novo agente determinístico: `Coletor CCT` (`agentes/coletor_cct.py`)
-    - Consolida `rules_index.json` por `(UF, Sindicato)` em um resumo consistente.
-    - Seleciona a melhor evidência (cláusulas explícitas > valores presentes > dias presentes).
-    - Persiste em SQLite como `regras_cct_resumo` para auditoria e consumo no cálculo.
-- __[Camada de Apresentação]__ (`streamlit_app.py`):
-  - Dashboard para disparar ingestão, visualizar status, executar cálculo e baixar relatórios.
+---
 
-### Diagrama de Arquitetura
+# Visão Geral (PT-BR)
+
+Este projeto automatiza o cálculo de VR/VA com uma pipeline multiagentes, um motor determinístico e um dashboard em Streamlit para operação, auditoria e testes rápidos (what‑if).
+
+## Arquitetura em alto nível
+
+- Camadas
+  - Apresentação: `streamlit_app.py` (dashboard Streamlit)
+  - Orquestração/Agentes: `agentes/`, prompts em `prompts/`
+  - Domínio/Negócio: `ferramentas/*.py` (cálculo determinístico, gerador de relatório, extração de CCT)
+  - Persistência: SQLite em `base_conhecimento/automacao_rh.db`, índices vetoriais em `base_conhecimento/faiss_*`, ChromaDB em `base_conhecimento/chromadb/`
+  - Ingestão: `ingest_ccts.py`, utilidades em `utils/`
+
+- Diretórios de dados
+  - Entradas: `dados_entrada/` (CSV/XLSX)
+  - PDFs de CCT: `base_conhecimento/ccts_pdfs/`
+  - Saídas: `relatorios_saida/` (XLSX/CSV/JSON)
+  - Embeddings locais: `models/` (Sentence-Transformers)
+
+## Agentes & Responsabilidades
+
+- Orquestrador: coordena agentes e ferramentas
+- Agente de Dados: valida e prepara bases (página 1)
+- Coletor CCT: consolida extrações em `rules_index.json` e resumos no SQLite
+- Analista CCT: responde dúvidas usando os índices FAISS/Chroma
+- Resolvedor VR/VA: decide a fonte do valor (Overrides → OCR/Index CCT → planilha Estado opcional → Padrão)
+- Compliance: gera observações (exibidas em `relatorios_saida/compliance.txt`)
+- Motor Determinístico: aplica competência, exclusões, proporcionalidades e totais
+
+## Regras determinísticas (resumo)
+
+- Exclusões: diretoria, estagiários, aprendizes, exterior, “afastado” heurístico
+- Admissões-only (Status col. D vazio): conta como ativo (UF padrão RS quando ausente)
+- Desligamentos:
+  - Com OK ≤ dia 15: exclui
+  - Sem OK: proporcional (se admitido no mês → limita ao dia 15; senão usa data de desligamento)
+- Férias/Afastamentos:
+  - Intervalos de datas subtraem dias úteis
+  - Apenas “N dias” sem datas → bloco sintético subtraindo N dias úteis a partir do início
+- Dias úteis por UF: `utils/calendario.py`, respeita a competência global
+- Financeiro: TOTAL = DIAS × VR_DIA; empresa 80% / empregado 20%
+- Prioridade da fonte de valor: Override → OCR/Index CCT → planilha Estado/Valor (opcional) → `VALOR_PADRAO`
+
+## Páginas do dashboard (como usar)
+
+- 0‑Mês Competência: define mês/ano e faixa de dias; valores alimentam a página 7
+- 1‑Importar Relatórios Base: faz upload para `dados_entrada/`; validação rápida; carga opcional no SQLite
+- 2‑Importar CCTs:
+  - Envie PDFs para `base_conhecimento/ccts_pdfs/`
+  - Rodar ingestão (Docling → texto → OCR)
+  - 2.2 Chat com CCTs: indexa PDFs em FAISS (`base_conhecimento/faiss_ccts/`) e permite perguntas
+- 3‑Validação de Regras CCT: registre Overrides (têm prioridade)
+- 4‑Cadastro de Feriados: mantém feriados por UF
+- 5‑Prompts: edite os `.md` de agentes
+- 7‑Dados Finais:
+  - 7.1 Geração de VR/VA/Consolidado
+  - 7.2 Visualização do Banco (SQLite)
+  - 7.3 Chat com Dados: indexa CSV/XLSX no FAISS (`base_conhecimento/faiss_tabelas/`) e permite perguntas
+
+## Prompts & LLM
+
+- Provedor/modelo/temperatura do LLM configurados na sidebar (aplicam‑se às respostas; embeddings são locais)
+- Prompts dos chats são externos e editáveis:
+  - `prompts/chat_cct.md`
+  - `prompts/chat_dados.md`
+- O histórico é injetado como `{chat_history}`; contexto de recuperação como `{context}`; pergunta atual como `{question}`
+
+## Embeddings & Índices Vetoriais
+
+- Embeddings: Sentence‑Transformers locais em `models/` (padrão `sentence-transformers/all-MiniLM-L6-v2`)
+- Download do modelo: botão na UI executa `download_model.py`
+- Índice CCTs (FAISS): `base_conhecimento/faiss_ccts/`
+- Índice Tabelas (FAISS): `base_conhecimento/faiss_tabelas/`
+- Observações do índice de tabelas:
+  - CSV/XLSX lidos com `dtype=str` para preservar zeros à esquerda
+  - XLSX: todas as abas são lidas; `source` registrado como `arquivo.xlsx#Aba`
+  - Reindexação automática quando a lista de arquivos muda
+
+## Setup
+
+1) Python 3.11+
+2) `pip install -r requirements.txt`
+3) Se faltar o modelo de embeddings, use o botão no Chat CCT para baixar
+4) Chaves de LLM opcionais: sidebar ou `.env`
+
+## Execução
+
+```bash
+streamlit run streamlit_app.py
+```
+
+## Guias rápidos
+
+- Chat CCT
+  - Coloque PDFs em `base_conhecimento/ccts_pdfs/`
+  - Clique “Indexar/Atualizar CCTs” → faça perguntas (fontes exibidas)
+
+- Chat Dados
+  - Coloque CSV/XLSX em `dados_entrada/`
+  - Clique “Indexar/Atualizar Dados Importados” → faça perguntas (fontes exibidas)
+
+- Geração VR/VA
+  - Defina competência na página 0
+  - Na página 7, execute “Executar e Gerar Relatório”
+
+## Troubleshooting
+
+- Embeddings: garanta `sentence-transformers` e `faiss-cpu` instalados; embeddings forçados para CPU no código
+- Pip resolver/hashes: `pip cache purge` e instalar com `--no-cache-dir`
+- Avisos `use_container_width`: cosméticos; migrar depois para `width='stretch'`
+
+# Diagramas (Mermaid)
+
+Os diagramas abaixo também estão versionados em `docs/architecture.mmd`.
+
+### Fluxo de Dados
 
 ```mermaid
 flowchart LR
-  subgraph Entrada
-    PDFs[CCT PDFs]
-    Bases[Arquivos XLSX/CSV em dados_entrada/]
+  %% Inputs
+  subgraph Inputs
+    A1[CCT PDFs\nbase_conhecimento/ccts_pdfs/]
+    A2[CSV/XLSX\ndados_entrada/]
   end
 
-  subgraph Ingestao[Camada de Ingestão]
-    ING[ingest_ccts.py]
-    DOC[Docling]
-    TXT[PyMuPDF/pdfplumber]
-    OCR[Tesseract OCR]
+  %% Ingestion & Tools
+  subgraph Ingestion
+    I1[ingest_ccts.py\nDocling → Text → OCR]
+    T1[ferramentas/extracao_cct_docling.py]
   end
 
-  subgraph Persistencia[Camada de Persistência]
+  %% Persistence
+  subgraph Persistence
     DB[(SQLite\nbase_conhecimento/automacao_rh.db)]
-    CHROMA[[ChromaDB\nbase_conhecimento/chromadb]]
-    RULES[rules_index.json]
+    CH[[ChromaDB\nbase_conhecimento/chromadb/]]
+    F_CCT[[FAISS CCTs\nbase_conhecimento/faiss_ccts/]]
+    F_TAB[[FAISS Tables\nbase_conhecimento/faiss_tabelas/]]
+    RJSON[rules_index.json]
   end
 
-  subgraph Orquestracao[Orquestração Multiagente]
-    ORQ[main.py\nOrquestrador]
-    A_DADOS[Agente Dados]
-    A_COLETOR[Coletor CCT]
-    A_ANALISTA[Analista CCT]
-    A_COMP[Compliance]
-    A_CALC[Especialista Cálculo]
-  end
-
-  subgraph Ferramentas
+  %% Processing
+  subgraph Processing
     CALC[ferramentas/calculadora_beneficios.py]
-    EXTRALLM[ferramentas/extracao_cct_llm.py\nextrair_regras_da_cct]
-    GERADOR[ferramentas/gerador_relatorio.py]
+    REPORT[ferramentas/gerador_relatorio.py]
   end
 
-  subgraph UI[Apresentação]
-    ST[Streamlit\nstreamlit_app.py]
+  %% Outputs
+  subgraph Outputs
+    OUT1[relatorios_saida/\nXLSX/CSV/JSON]
   end
 
-  PDFs --> ING
-  ING --> DOC
-  ING --> TXT
-  ING --> OCR
-  DOC --> DB
-  TXT --> DB
-  OCR --> DB
-  DOC --> CHROMA
-  TXT --> CHROMA
-  OCR --> CHROMA
-  ING --> RULES
-
-  Bases --> A_DADOS
-  ST --> ORQ
-  ORQ --> A_DADOS
-  ORQ --> A_COLETOR
-  ORQ --> A_ANALISTA
-  ORQ --> A_COMP
-  ORQ --> A_CALC
-
-  A_COLETOR --> DB
-  A_COLETOR --> RULES
-  A_ANALISTA --> CHROMA
-  A_COMP --> DB
-  A_CALC --> CALC
-  CALC --> DB
-  CALC --> CHROMA
-  CALC -. fallback .-> EXTRALLM
-  EXTRALLM --> CHROMA
-
-  GERADOR --> DB
-  A_CALC --> GERADOR
-  GERADOR --> ST
-  DB --> ST
-  RULES --> ST
+  %% Data flow
+  A1 --> I1
+  I1 --> DB
+  I1 --> CH
+  I1 --> RJSON
+  A2 --> F_TAB
+  CH --> F_CCT
+  DB --> CALC
+  F_CCT --> CALC
+  CALC --> REPORT
+  REPORT --> OUT1
 ```
 
-Fluxo alto nível:
-1) PDFs → `ingest_ccts.py` → Docling/Texto/OCR → `regras_cct` + ChromaDB
-2) Dados de entrada (XLSX/CSV) → SQLite
-3) Orquestração/Agentes → `Dados` → `Coletor CCT` → `Analista CCT` → `Compliance` → `Cálculo` → `relatorios_saida/`
-4) Streamlit consome SQLite/arquivos para visualização e ações
+### Comunicação entre Agentes
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant UI as Streamlit UI
+  participant ORQ as Orchestrator (main.py)
+  participant D as Data Agent
+  participant COL as CCT Collector
+  participant ANA as CCT Analyst
+  participant CAL as Calc Specialist
+  participant CMP as Compliance
+  participant TOOLS as Tools (ferramentas/*.py)
+  participant DB as SQLite/Indexes
+
+  UI->>ORQ: Start monthly run / request
+  ORQ->>D: Validate/load base tables
+  D-->>DB: Persist/load datasets
+  ORQ->>COL: Consolidate CCT rules (rules_index.json → DB)
+  COL-->>DB: Upsert regras_cct/resumo
+  ORQ->>ANA: Query CCTs (when needed)
+  ANA-->>DB: Retrieve from FAISS/Chroma
+  ORQ->>CAL: Execute deterministic calculation
+  CAL->>TOOLS: Use calculadora_beneficios.py
+  TOOLS-->>DB: Read/write intermediates
+  ORQ->>CMP: Produce observations
+  CMP-->>DB: Save compliance notes
+  ORQ->>TOOLS: Generate final report
+  TOOLS-->>UI: Make file(s) available in relatorios_saida/
+```
+
+### Fluxo Visual (UI)
+
+```mermaid
+flowchart TB
+  subgraph Sidebar
+    SB1[LLM Provider/Model/Temp]
+  end
+
+  subgraph UI[Streamlit Pages]
+    P0[0 - Mês Competência\nSet window (YYYY-MM, day range)]
+    P1[1 - Importar Relatórios Base\nUpload CSV/XLSX, SQLite load]
+    P2[2 - Importar CCTs\nUpload PDFs, Ingest]
+    P22[2.2 - Chat com CCTs\nBuild/Use FAISS CCTs]
+    P3[3 - Validação de Regras CCT\nRegister Overrides]
+    P4[4 - Cadastro de Feriados\nManage holidays by UF]
+    P5[5 - Prompts\nEdit prompts/*.md]
+    P7[7 - Dados Finais\nRun calc, DB viewer, Data Chat]
+  end
+
+  SB1 --- P22
+  SB1 --- P7
+
+  P0 --> P7
+  P1 --> P7
+  P2 --> P22
+  P2 --> P3
+  P22 --> P7
+  P3 --> P7
+  P4 --> P7
+  P5 --> P7
+
+  P7 -->|Generate| OUT[relatorios_saida/]
+```
+
+# Project Overview (English)
+
+This project automates VR/VA calculation using a multi-agent pipeline, a deterministic engine, and a Streamlit dashboard for operations, audit, and what‑if analysis.
+
+## Architecture at a glance
+
+- Application layers
+  - Presentation: `streamlit_app.py` (Streamlit dashboard)
+  - Orchestration/Agents: `agentes/`, prompts in `prompts/`
+  - Domain/Business: `ferramentas/*.py` (deterministic calculator, report generator, CCT extraction)
+  - Persistence: SQLite at `base_conhecimento/automacao_rh.db`, FAISS at `base_conhecimento/faiss_*`, ChromaDB at `base_conhecimento/chromadb/`
+  - Ingestion: `ingest_ccts.py`, utilities in `utils/`
+
+- Data directories
+  - Inputs: `dados_entrada/` (CSV/XLSX)
+  - CCT PDFs: `base_conhecimento/ccts_pdfs/`
+  - Outputs: `relatorios_saida/` (XLSX/CSV/JSON)
+  - Local embeddings: `models/` (Sentence-Transformers)
+
+## Agents & Responsibilities
+
+- Orchestrator (main): coordinates specialized agents and tools
+- Data Agent: validates and prepares base files (page 1)
+- CCT Collector: consolidates extractions into `rules_index.json` and SQLite summaries
+- CCT Analyst: answers CCT-specific questions using FAISS/Chroma indexes
+- VR/VA Resolver: selects value source (Overrides → CCT OCR/Index → optional State sheet → Default)
+- Compliance: emits observations (`relatorios_saida/compliance.txt`)
+- Deterministic Engine: applies competence window, exclusions, proportionalities and totals
+
+## Deterministic Rules (summary)
+
+- Exclusions: directors, interns, apprentices, abroad, heuristic away (“afastado”)
+- Admissions-only (Status col. D empty): included as active (UF default RS if missing)
+- Terminations: OK ≤ 15 → excluded; else proportional (if admitted in month → clamp to 15; else termination date)
+- Vacations/Away: date ranges subtract business days; only N-without-dates → synthetic block from window start
+- Business days by UF via `utils/calendario.py`
+- Financials: TOTAL = DIAS × VR_DIA; company 80% / employee 20%
+- Value priority: Overrides → CCT OCR/Index → State sheet (optional) → `VALOR_PADRAO`
+
+## UI Pages (how to)
+
+- 0-Mês Competência: set month/year and day range
+- 1-Importar Relatórios Base: upload to `dados_entrada/` and optionally load into SQLite
+- 2-Importar CCTs: upload PDFs, run ingestion; 2.2 CCT Chat builds FAISS and answers
+- 3-Validação de Regras CCT: register Overrides
+- 4-Cadastro de Feriados: maintain holidays by UF
+- 5-Prompts: edit agent prompts
+- 7-Dados Finais: generation, DB viewer, Data Chat (FAISS over tables)
+
+## Prompts & LLM
+
+- Provider/model/temperature set in sidebar (applies to answers, not embeddings)
+- External chat prompts: `prompts/chat_cct.md` and `prompts/chat_dados.md`
+- Templates receive `{context}`, `{chat_history}`, `{question}`
+
+## Embeddings & Indexes
+
+- Local Sentence-Transformers in `models/` (default `sentence-transformers/all-MiniLM-L6-v2`)
+- Download via button running `download_model.py`
+- FAISS indexes: CCTs → `base_conhecimento/faiss_ccts/`, Tables → `base_conhecimento/faiss_tabelas/`
+- Tables notes: CSV/XLSX read with `dtype=str`; all sheets; `file.xlsx#Sheet`; auto rebuild on file changes
+
+## Setup
+
+1) Python 3.11+
+2) `pip install -r requirements.txt`
+3) If embeddings model missing, use the CCT Chat button
+4) Optional LLM keys via sidebar or `.env`
+
+## Running
+
+```bash
+streamlit run streamlit_app.py
+```
+
+## Quick Guides
+
+- CCT chat: put PDFs in `base_conhecimento/ccts_pdfs/` → index → ask
+- Data chat: put CSV/XLSX in `dados_entrada/` → index → ask
+- Generate VR/VA: set competence (page 0) → run in page 7
+
+## Troubleshooting
+
+- Embeddings: ensure `sentence-transformers` and `faiss-cpu`; embeddings forced to CPU
+- Pip cache/hashes: `pip cache purge` and reinstall with `--no-cache-dir`
+- Streamlit deprecations: replace `use_container_width` with `width='stretch'` when convenient
 
 ## Setup
 1) Crie o ambiente virtual:

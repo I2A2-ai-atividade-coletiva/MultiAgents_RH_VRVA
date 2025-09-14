@@ -1,0 +1,113 @@
+%% Architecture diagrams for MultiAgents_RH_VRVA
+%% All documentation is in English as per project rules.
+
+%% ---------------------------------------------
+%% 1) Data Flow (Ingestion, Persistence, Processing)
+%% ---------------------------------------------
+flowchart LR
+  %% Inputs
+  subgraph Inputs
+    A1[CCT PDFs\nbase_conhecimento/ccts_pdfs/]
+    A2[CSV/XLSX\ndados_entrada/]
+  end
+
+  %% Ingestion & Tools
+  subgraph Ingestion
+    I1[ingest_ccts.py\nDocling → Text → OCR]
+    T1[ferramentas/extracao_cct_docling.py]
+  end
+
+  %% Persistence
+  subgraph Persistence
+    DB[(SQLite\nbase_conhecimento/automacao_rh.db)]
+    CH[[ChromaDB\nbase_conhecimento/chromadb/]]
+    F_CCT[[FAISS CCTs\nbase_conhecimento/faiss_ccts/]]
+    F_TAB[[FAISS Tables\nbase_conhecimento/faiss_tabelas/]]
+    RJSON[rules_index.json]
+  end
+
+  %% Processing
+  subgraph Processing
+    CALC[ferramentas/calculadora_beneficios.py]
+    REPORT[ferramentas/gerador_relatorio.py]
+  end
+
+  %% Outputs
+  subgraph Outputs
+    OUT1[relatorios_saida/\nXLSX/CSV/JSON]
+  end
+
+  %% Data flow
+  A1 --> I1
+  I1 --> DB
+  I1 --> CH
+  I1 --> RJSON
+  A2 --> F_TAB
+  CH --> F_CCT
+  DB --> CALC
+  F_CCT --> CALC
+  CALC --> REPORT
+  REPORT --> OUT1
+
+%% ---------------------------------------------
+%% 2) Agents Communication (Sequence)
+%% ---------------------------------------------
+sequenceDiagram
+  autonumber
+  participant UI as Streamlit UI
+  participant ORQ as Orchestrator (main.py)
+  participant D as Data Agent
+  participant COL as CCT Collector
+  participant ANA as CCT Analyst
+  participant CAL as Calc Specialist
+  participant CMP as Compliance
+  participant TOOLS as Tools (ferramentas/*.py)
+  participant DB as SQLite/Indexes
+
+  UI->>ORQ: Start monthly run / request
+  ORQ->>D: Validate/load base tables
+  D-->>DB: Persist/load datasets
+  ORQ->>COL: Consolidate CCT rules (rules_index.json → DB)
+  COL-->>DB: Upsert regras_cct/resumo
+  ORQ->>ANA: Query CCTs (when needed)
+  ANA-->>DB: Retrieve from FAISS/Chroma
+  ORQ->>CAL: Execute deterministic calculation
+  CAL->>TOOLS: Use calculadora_beneficios.py
+  TOOLS-->>DB: Read/write intermediates
+  ORQ->>CMP: Produce observations
+  CMP-->>DB: Save compliance notes
+  ORQ->>TOOLS: Generate final report
+  TOOLS-->>UI: Make file(s) available in relatorios_saida/
+
+%% ---------------------------------------------
+%% 3) Visual Flow (UI Pages)
+%% ---------------------------------------------
+flowchart TB
+  subgraph Sidebar
+    SB1[LLM Provider/Model/Temp]
+  end
+
+  subgraph UI[Streamlit Pages]
+    P0[0 - Mês Competência\nSet window (YYYY-MM, day range)]
+    P1[1 - Importar Relatórios Base\nUpload CSV/XLSX, SQLite load]
+    P2[2 - Importar CCTs\nUpload PDFs, Ingest]
+    P22[2.2 - Chat com CCTs\nBuild/Use FAISS CCTs]
+    P3[3 - Validação de Regras CCT\nRegister Overrides]
+    P4[4 - Cadastro de Feriados\nManage holidays by UF]
+    P5[5 - Prompts\nEdit prompts/*.md]
+    P7[7 - Dados Finais\nRun calc, DB viewer, Data Chat]
+  end
+
+  SB1 --- P22
+  SB1 --- P7
+
+  P0 --> P7
+  P1 --> P7
+  P2 --> P22
+  P2 --> P3
+  P22 --> P7
+  P3 --> P7
+  P4 --> P7
+  P5 --> P7
+
+  P7 -->|Generate| OUT[relatorios_saida/]
