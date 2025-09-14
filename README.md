@@ -241,14 +241,14 @@ flowchart TB
   end
 
   subgraph UI[Streamlit Pages]
-    P0[0 - Mês Competência\nSet window (YYYY-MM, day range)]
-    P1[1 - Importar Relatórios Base\nUpload CSV/XLSX, SQLite load]
-    P2[2 - Importar CCTs\nUpload PDFs, Ingest]
-    P22[2.2 - Chat com CCTs\nBuild/Use FAISS CCTs]
-    P3[3 - Validação de Regras CCT\nRegister Overrides]
-    P4[4 - Cadastro de Feriados\nManage holidays by UF]
-    P5[5 - Prompts\nEdit prompts/*.md]
-    P7[7 - Dados Finais\nRun calc, DB viewer, Data Chat]
+    P0["0 - Mes Competencia - Set window (YYYY-MM, day range)"]
+    P1["1 - Importar Relatorios Base - Upload CSV/XLSX, SQLite load"]
+    P2["2 - Importar CCTs - Upload PDFs, Ingest"]
+    P22["2.2 - Chat com CCTs - Build/Use FAISS CCTs"]
+    P3["3 - Validacao de Regras CCT - Register Overrides"]
+    P4["4 - Cadastro de Feriados - Manage holidays by UF"]
+    P5["5 - Prompts - Edit prompts/*.md"]
+    P7["7 - Dados Finais - Run calc, DB viewer, Data Chat"]
   end
 
   SB1 --- P22
@@ -262,8 +262,7 @@ flowchart TB
   P3 --> P7
   P4 --> P7
   P5 --> P7
-
-  P7 -->|Generate| OUT[relatorios_saida/]
+  P7 -->|Generate| OUT["relatorios_saida/"]
 ```
 
 # Project Overview (English)
