@@ -90,6 +90,7 @@ Este projeto automatiza o cálculo de VR/VA com uma pipeline multiagentes, um mo
 - 3‑Validação de Regras CCT: registre Overrides (têm prioridade)
 - 4‑Cadastro de Feriados: mantém feriados por UF
 - 5‑Prompts: edite os `.md` de agentes
+- 6- Notificações: avaliação rapida dos dados importados, como quantidade de funcionarios, ocorrências, admissões e desligamentos, além de validação de diferença de valores entre base estado e cct (caso o ocr extraia corretamente), e também sindicato x valor.
 - 7‑Dados Finais:
   - 7.1 Geração de VR/VA/Consolidado
   - 7.2 Visualização do Banco (SQLite)
