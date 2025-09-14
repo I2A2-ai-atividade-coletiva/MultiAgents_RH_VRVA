@@ -38,6 +38,36 @@ def resolve_cct_rules(uf: str, sindicato: str) -> Dict[str, Any]:
     uf_key = (uf or "").upper()
     sind_key = (sindicato or "").strip()
 
+    # 0) Resultado consolidado pelo especialista (tabela resolvida)
+    try:
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT vr_valor, va_valor, dias, periodicidade, condicao, origem, confidence
+                FROM regras_cct_vrva_resolvidas
+                WHERE uf = ? AND sindicato = ?
+                """,
+                (uf_key, sind_key),
+            )
+            row = cur.fetchone()
+            if row:
+                out = {}
+                if row[0] is not None: out["vr_valor"] = row[0]
+                if row[1] is not None: out["va_valor"] = row[1]
+                if row[2] is not None:
+                    try:
+                        out["dias"] = int(row[2])
+                    except Exception:
+                        pass
+                if row[3] is not None: out["periodicidade"] = row[3]
+                if row[4] is not None: out["condicao"] = row[4]
+                out["origem"] = (row[5] or "") + ";resolver"
+                out["confidence"] = row[6]
+                return out
+    except Exception:
+        pass
+
     # 1) Overrides
     overrides = _read_json(RULES_OVERRIDES) or {}
     k = f"{uf_key}::{sind_key}"

@@ -1,0 +1,25 @@
+{
+  "include_adm_only": true,
+  "default_sindicato": "RS",
+  "valor_padrao_uf": {
+    "PR": 35.0,
+    "RJ": 35.0,
+    "RS": 35.0,
+    "SP": 37.5
+  },
+  "dias_fixos_uf": {
+    "PR": 21,
+    "RJ": 21,
+    "RS": 22,
+    "SP": 22
+  },
+  "ferias_sinteticas": {
+    "enable": false,
+    "alocacao": "inicio",
+    "dias_col_candidates": [
+      "dias",
+      "dias_ferias",
+      "qtd_dias"
+    ]
+  }
+}

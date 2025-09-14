@@ -12,6 +12,56 @@ from ferramentas.calculadora_beneficios import calcular_financeiro_vr
 from io import BytesIO
 from utils.regras_resolver import resolve_cct_rules
 from ferramentas.calculadora_beneficios import _find_col, _should_exclude, UF_MAP, _find_file_by_keywords
+from utils.config import get_competencia, set_competencia
+from utils.config import get_llm
+from utils.prompt_loader import carregar_prompt
+
+# Chat com CCTs 
+try:
+    from langchain_community.document_loaders.pdf import PyPDFLoader  # novo caminho
+except Exception:
+    try:
+        from langchain_community.document_loaders import PyPDFLoader  # caminho alternativo
+    except Exception:
+        PyPDFLoader = None
+try:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+except Exception:
+    RecursiveCharacterTextSplitter = None
+try:
+    from langchain_community.vectorstores.faiss import FAISS
+except Exception:
+    FAISS = None
+try:
+    from langchain_openai import OpenAIEmbeddings
+except Exception:
+    OpenAIEmbeddings = None
+try:
+    from langchain_google_genai import GoogleGenerativeAIEmbeddings
+except Exception:
+    GoogleGenerativeAIEmbeddings = None
+try:
+    from langchain_community.embeddings.huggingface import HuggingFaceEmbeddings
+except Exception:
+    HuggingFaceEmbeddings = None
+try:
+    from langchain.schema import HumanMessage
+except Exception:
+    HumanMessage = None
+
+def _format_history_for_prompt(items):
+    """Serialize Q/A history to a plain text conversation (oldest -> newest)."""
+    if not items:
+        return ""
+    lines = []
+    for it in reversed(items):  # oldest first for model context
+        q = (it.get('q') or '').strip()
+        a = (it.get('a') or '').strip()
+        if q:
+            lines.append(f"Human: {q}")
+        if a:
+            lines.append(f"AI: {a}")
+    return "\n".join(lines)
 
 BASE_DIR = Path(__file__).resolve().parent
 DADOS_DIR = BASE_DIR / "dados_entrada"
@@ -19,7 +69,10 @@ CCTS_DIR = BASE_DIR / "base_conhecimento" / "ccts_pdfs"
 RELATORIOS_DIR = BASE_DIR / "relatorios_saida"
 PROMPTS_DIR = BASE_DIR / "prompts"
 CHROMA_DIR = BASE_DIR / "base_conhecimento" / "chromadb"
+FAISS_CCTS_DIR = BASE_DIR / "base_conhecimento" / "faiss_ccts"
 RULES_INDEX_ROOT = BASE_DIR / "base_conhecimento" / "rules_index.json"
+MODELS_DIR = BASE_DIR / "models"
+FAISS_TABELAS_DIR = BASE_DIR / "base_conhecimento" / "faiss_tabelas"
 
 DADOS_DIR.mkdir(parents=True, exist_ok=True)
 CCTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -27,6 +80,18 @@ RELATORIOS_DIR.mkdir(parents=True, exist_ok=True)
 PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
 
 st.set_page_config(page_title="Automação RH - Multiagentes", layout="wide")
+
+# Reduce noisy logs (PyTorch/Transformers) seen as 'Examining the path of torch.classes...'
+import logging, warnings
+for _lg in ["torch", "transformers", "sentence_transformers", "faiss", "langchain"]:
+    try:
+        logging.getLogger(_lg).setLevel(logging.ERROR)
+    except Exception:
+        pass
+try:
+    warnings.filterwarnings("ignore", message=r"Examining the path of torch\.classes.*")
+except Exception:
+    pass
 
 # Global font standardization
 st.markdown(
@@ -46,6 +111,7 @@ st.markdown(
     h1 { font-weight: 700; }
     h2 { font-weight: 600; }
     h3, h4, h5, h6 { font-weight: 600; }
+    p { font-feature-settings: "ss01" on; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -58,20 +124,109 @@ with st.sidebar:
     page = st.radio(
         "Páginas",
         [
-            "Importar Relatórios Base",
-            "Importar CCTs",
-            "Regras CCT",
-            "Feriados",
-            "Prompts",
-            "Notificações",
-            "Dados Finais",
+            "0-Mês Competência",
+            "1-Importar Relatórios Base",
+            "2-Importar CCTs",
+            "3-Validação de Regras CCT",
+            "4-Cadastro de Feriados",
+            "5-Prompts",
+            "6-Notificações",
+            "7-Dados Finais",
         ],
         index=0,
     )
+# ---------------- Sidebar: LLM & API Keys ----------------
+with st.sidebar:
+    st.markdown("### Configuração de LLM & APIs")
+    # Provider
+    prov_default = os.environ.get("LLM_PROVIDER", "google").lower()
+    provider = st.selectbox("Provedor LLM", ["google", "groq"], index=0 if prov_default=="google" else 1)
+    # Modelos e temperatura
+    if provider == "google":
+        model_default = os.environ.get("GENAI_MODEL", "gemini-1.5-pro")
+        model = st.text_input("Modelo (Google)", value=model_default)
+        api_key_default = os.environ.get("GOOGLE_API_KEY", "")
+        api_key = st.text_input("GOOGLE_API_KEY", value=api_key_default, type="password")
+    else:
+        model_default = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+        model = st.text_input("Modelo (Groq)", value=model_default)
+        api_key_default = os.environ.get("GROQ_API_KEY", "")
+        api_key = st.text_input("GROQ_API_KEY", value=api_key_default, type="password")
+    temperature = st.slider("Temperatura", min_value=0.0, max_value=1.0, value=float(os.environ.get("GENAI_TEMPERATURE", "0.2")), step=0.05)
+    st.caption("Ajuste de sessão: os valores serão aplicados imediatamente nesta execução.")
+    if st.button("Aplicar configurações"):
+        # Provider
+        os.environ["LLM_PROVIDER"] = provider
+        if provider == "google":
+            os.environ["GENAI_MODEL"] = model
+            if api_key:
+                os.environ["GOOGLE_API_KEY"] = api_key
+        else:
+            os.environ["GROQ_MODEL"] = model
+            if api_key:
+                os.environ["GROQ_API_KEY"] = api_key
+        os.environ["GENAI_TEMPERATURE"] = str(temperature)
+        st.success("Configurações aplicadas nesta sessão.")
+
+
+# Página: Mês Competência (global)
+if page == "0-Mês Competência":
+    st.subheader("0.1 Definir mês/ano e janela de competência")
+    st.caption("A janela de competência será usada em todo o cálculo: de {dia_início} do mês anterior até {dia_fim} do mês de referência.")
+
+    cfg = get_competencia() or {}
+    import calendar as _cal
+    from datetime import date as _date
+    today = _date.today()
+    cur_year = int(cfg.get("year") or today.year)
+    cur_month = int(cfg.get("month") or today.month)
+    start_prev = int(cfg.get("start_day_prev") or 1)
+    end_ref = int(cfg.get("end_day_ref") or _cal.monthrange(cur_year, cur_month)[1])
+
+    col1, col2 = st.columns(2)
+    with col1:
+        year = st.number_input("Ano (YYYY)", min_value=2000, max_value=2100, value=cur_year)
+    with col2:
+        month = st.number_input("Mês (1-12)", min_value=1, max_value=12, value=cur_month)
+
+    # Validar dias disponíveis para meses anterior e de referência
+    if month == 1:
+        py, pm = int(year) - 1, 12
+    else:
+        py, pm = int(year), int(month) - 1
+    max_prev = _cal.monthrange(py, pm)[1]
+    max_ref = _cal.monthrange(int(year), int(month))[1]
+
+    c3, c4 = st.columns(2)
+    with c3:
+        start_day_prev = st.number_input(f"Dia início no mês anterior (1..{max_prev})", min_value=1, max_value=max_prev, value=min(start_prev, max_prev))
+    with c4:
+        end_day_ref = st.number_input(f"Dia fim no mês de referência (1..{max_ref})", min_value=1, max_value=max_ref, value=min(end_ref, max_ref))
+
+    # Mostrar janela resultante
+    try:
+        start_date = _date(py, pm, int(start_day_prev))
+        end_date = _date(int(year), int(month), int(end_day_ref))
+        st.info(f"Janela configurada: {start_date} → {end_date}")
+    except Exception as e:
+        st.error(f"Janela inválida: {e}")
+
+    if st.button("Salvar competência"):
+        try:
+            set_competencia(int(year), int(month), int(start_day_prev), int(end_day_ref))
+            st.success("Competência salva com sucesso. Essa configuração será usada em todo o cálculo determinístico.")
+        except Exception as e:
+            st.error(f"Falha ao salvar competência: {e}")
+
+    st.divider()
+    st.markdown("### 0.2 Configuração atual")
+    st.code(json.dumps(get_competencia(), ensure_ascii=False, indent=2))
 
 # Página: Importar Relatórios Base
-if page == "Importar Relatórios Base":
-    st.subheader("Importação de Relatórios Base")
+elif page == "1-Importar Relatórios Base":
+    st.subheader(" 1.1 Importação de Relatórios Base")
+    st.caption("Arquivos base (Excel/CSV) — faça o upload para a pasta dados_entrada/.")
+
     base_files = st.file_uploader(
         "Arquivos base (Excel/CSV)", accept_multiple_files=True,
         type=["xlsx", "csv"], key="bases"
@@ -103,8 +258,7 @@ if page == "Importar Relatórios Base":
         if erros:
             st.error("Falha ao validar/salvar alguns arquivos:\n" + "\n".join(erros))
 
-    st.divider()
-    st.markdown("### Carregar TODOS os arquivos de dados_entrada/ para o Banco (uma tabela por arquivo/aba)")
+    st.markdown("### 1.2 Carregar TODOS os arquivos de dados_entrada/ para o Banco (uma tabela por arquivo/aba)")
     st.caption("Cria uma tabela para cada arquivo CSV e uma tabela por aba em Excel. Nomes de tabela são normalizados.")
     if st.button("Carregar tudo no SQLite"):
         try:
@@ -150,10 +304,8 @@ if page == "Importar Relatórios Base":
         except Exception as e:
             st.error(f"Falha no carregamento em massa: {e}")
 
-    # (Seção removida: geração de tabela final e carga individual para dados_consolidados)
-
     st.divider()
-    st.markdown("### Validação de Qualidade de Dados")
+    st.markdown("### 1.3 Validação de Qualidade de Dados")
     st.caption("Executa checagens de qualidade (colunas, tipos, duplicidades, datas) em dados_entrada/ antes do cálculo.")
     if st.button("Executar validação de dados"):
         try:
@@ -190,12 +342,16 @@ if page == "Importar Relatórios Base":
             st.error(f"Falha na validação de dados: {e}")
 
     st.divider()
-    st.markdown("### Validação rápida inserção de dados no banco de dados")
+    st.markdown("### 1.4 Validação rápida inserção de dados no banco de dados")
     st.caption("Executa um cálculo rápido para sinalizar casos que podem exigir validação: origem de valor, comunicados até dia 15 e linhas sem valor.")
     from datetime import date as _date
     hoje = _date.today()
     # Seletor de competência via calendário (usa ano-mês do valor selecionado)
-    _default_comp = _date(hoje.year, hoje.month, 1)
+    _cfg = get_competencia() or {}
+    if _cfg.get("year") and _cfg.get("month"):
+        _default_comp = _date(int(_cfg["year"]), int(_cfg["month"]), 1)
+    else:
+        _default_comp = _date(hoje.year, hoje.month, 1)
     _comp_date = st.date_input("Competência p/ validação", value=_default_comp, format="YYYY-MM-DD", help="Selecione a competência no calendário", key="comp_valid_date")
     comp_val = f"{_comp_date.year:04d}-{_comp_date.month:02d}"
     if st.button("Executar validação"):
@@ -290,8 +446,8 @@ if page == "Importar Relatórios Base":
             st.error(f"Falha na validação: {e}")
 
 # Página: Importar CCTs
-elif page == "Importar CCTs":
-    st.subheader("Importação de CCTs (PDF)")
+elif page == "2-Importar CCTs":
+    st.subheader("2.1 Importação de CCTs (PDF)")
     cct_files = st.file_uploader(
         "CCTs (PDF)", accept_multiple_files=True, type=["pdf"], key="pdfs"
     )
@@ -301,10 +457,7 @@ elif page == "Importar CCTs":
             with open(out_path, "wb") as out:
                 out.write(f.read())
         st.success(f"Salvos em {CCTS_DIR}")
-
-    st.divider()
-    st.subheader("Ingestão das CCTs")
-    if st.button("Rodar ingest_ccts.py"):
+    if st.button("Rodar ingestão de dados CCT"):
         with st.spinner("Ingerindo CCTs..."):
             proc = subprocess.Popen(
                 [sys.executable, str(BASE_DIR / "ingest_ccts.py")],
@@ -319,9 +472,141 @@ elif page == "Importar CCTs":
             proc.wait()
             st.success(f"Ingestão finalizada (exit={proc.returncode}).")
 
+
+    st.divider()
+    st.subheader("2.2 Chat com CCTs (consulta assistida)")
+    st.caption("Converse com o conteúdo das CCTs em base_conhecimento/ccts_pdfs/. O índice local é salvo em base_conhecimento/faiss_ccts.")
+
+    def _ccts_list():
+        return sorted([p.name for p in CCTS_DIR.glob("*.pdf")])
+
+    def _get_embeddings():
+        # Usa embeddings locais do diretório models/ (SentenceTransformers via HuggingFaceEmbeddings)
+        if HuggingFaceEmbeddings is None:
+            st.error("Pacote de embeddings locale (HuggingFaceEmbeddings) não disponível. Instale langchain-community e sentence-transformers.")
+            st.stop()
+        model_id = os.getenv("HUGGINGFACE_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+        local_path = MODELS_DIR / model_id
+        if not local_path.exists():
+            st.warning(f"Modelo de embeddings não encontrado em '{local_path}'.")
+            if st.button("Baixar modelo de embeddings agora"):
+                try:
+                    proc = subprocess.Popen(
+                        [sys.executable, str(BASE_DIR / "download_model.py")],
+                        cwd=str(BASE_DIR), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+                    )
+                    log = st.empty()
+                    lines = []
+                    for line in proc.stdout:
+                        lines.append(line.rstrip())
+                        log.code("\n".join(lines))
+                    proc.wait()
+                    if proc.returncode == 0 and local_path.exists():
+                        st.success("Modelo baixado com sucesso. Prosseguindo...")
+                    else:
+                        st.error("Falha ao baixar o modelo. Verifique o console acima.")
+                        st.stop()
+                except Exception as e:
+                    st.error(f"Erro ao executar download_model.py: {e}")
+                    st.stop()
+            else:
+                st.stop()
+        try:
+            return HuggingFaceEmbeddings(model_name=str(local_path), model_kwargs={"device": "cpu"})
+        except Exception as e:
+            st.error(f"Falha ao carregar embeddings locais: {e}")
+            st.stop()
+
+    def _build_or_load_faiss(force=False):
+        FAISS_CCTS_DIR.mkdir(parents=True, exist_ok=True)
+        emb = _get_embeddings()
+        index_path = FAISS_CCTS_DIR / "index"
+        if not force and index_path.exists():
+            try:
+                return FAISS.load_local(str(index_path), embeddings=emb, allow_dangerous_deserialization=True)
+            except Exception:
+                pass
+        # construir
+        docs_all = []
+        for pdf in CCTS_DIR.glob("*.pdf"):
+            try:
+                loader = PyPDFLoader(str(pdf))
+                docs = loader.load()
+                splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200)
+                chunks = splitter.split_documents(docs)
+                for i, d in enumerate(chunks):
+                    d.metadata["source"] = pdf.name
+                    d.metadata["doc_id"] = i
+                docs_all.extend(chunks)
+            except Exception as e:
+                st.warning(f"Falha ao ler {pdf.name}: {e}")
+        if not docs_all:
+            st.info("Nenhum PDF em ccts_pdfs/.")
+            st.stop()
+        vs = FAISS.from_documents(docs_all, embedding=emb)
+        vs.save_local(str(index_path))
+        return vs
+
+    c1, c2 = st.columns([1,1])
+    with c1:
+        if st.button("Indexar/Atualizar CCTs"):
+            try:
+                _build_or_load_faiss(force=True)
+                st.success("Índice atualizado com sucesso.")
+            except Exception as e:
+                st.error(f"Falha ao indexar: {e}")
+    with c2:
+        arquivos = _ccts_list()
+        st.write("Arquivos em CCTs:", arquivos or "(vazio)")
+
+    # chat simples
+    try:
+        vs = _build_or_load_faiss(force=False)
+        retriever = vs.as_retriever(search_kwargs={"k": 4})
+    except Exception as e:
+        st.error(f"Falha ao carregar índice: {e}")
+        retriever = None
+
+    if retriever is not None:
+        # Histórico acima do input (ordem decrescente)
+        st.markdown("**Histórico**")
+        c_hist = st.session_state.setdefault('cct_chat_history', [])  # lista de dicts {q,a,srcs}
+        if c_hist:
+            for item in c_hist:
+                st.markdown(f"- Pergunta: {item.get('q','')}")
+                st.markdown(f"- Resposta: {item.get('a','')}")
+                srcs = item.get('srcs') or []
+                if srcs:
+                    st.caption("Fontes: " + ", ".join(srcs))
+            st.divider()
+
+        with st.form("cct_chat_form"):
+            pergunta = st.text_input("Pergunte algo sobre as CCTs (ex.: qual o VR diário para RJ?)", value="")
+            enviar = st.form_submit_button("Enviar")
+        if enviar and pergunta.strip():
+            try:
+                docs = retriever.get_relevant_documents(pergunta)
+                contexto = "\n\n".join([d.page_content for d in docs])
+                fontes = sorted({(d.metadata or {}).get("source", "?") for d in docs})
+                llm = get_llm()
+                _tmpl_cct = carregar_prompt("chat_cct")
+                prompt = _tmpl_cct.format(
+                    context=contexto,
+                    chat_history=_format_history_for_prompt(c_hist),
+                    question=pergunta,
+                )
+                resp = llm.invoke([HumanMessage(content=prompt)])
+                answer = getattr(resp, "content", str(resp))
+                # Prepend no histórico (mais recente no topo)
+                c_hist.insert(0, {"q": pergunta, "a": answer, "srcs": list(fontes)})
+                st.session_state['cct_chat_history'] = c_hist
+                st.experimental_rerun()
+            except Exception as e:
+                st.error(f"Falha na conversa: {e}")
+
 # Página: Feriados
-elif page == "Feriados":
-    st.subheader("Cadastro de Feriados (para cálculo de dias úteis)")
+elif page == "4-Cadastro de Feriados":
+    st.subheader("4.1 Cadastro de Feriados (para cálculo de dias úteis)")
     path_csv = DADOS_DIR / "feriados.csv"
 
     def carregar_df():
@@ -383,7 +668,7 @@ elif page == "Feriados":
             except Exception:
                 st.error("Data inválida. Use o formato YYYY-MM-DD.")
 
-    st.markdown("### Lista de Feriados")
+    st.markdown("### 4.2 Lista de Feriados")
     df_edit = st.data_editor(
         df,
         use_container_width=True,
@@ -437,7 +722,7 @@ elif page == "Feriados":
                 st.info("Não há dados para baixar.")
 
     st.divider()
-    st.markdown("### Atualizar feriados automaticamente (feriados.com.br)")
+    st.markdown("### 4.3 Atualizar feriados automaticamente (feriados.com.br)")
     from datetime import date as _date
     _today = _date.today()
     c1, c2 = st.columns([1,2])
@@ -459,8 +744,8 @@ elif page == "Feriados":
             st.error(f"Falha ao atualizar feriados: {e}")
 
 # Página: Regras CCT (configurar quando OCR não extraiu)
-elif page == "Regras CCT":
-    st.subheader("Configuração de Regras (VR/VA) por Sindicato/UF")
+elif page == "3-Validação de Regras CCT":
+    st.subheader("3.1 Informações de Regras CCT")
     CHROMA_DIR.mkdir(parents=True, exist_ok=True)
     rules_index_path = RULES_INDEX_ROOT
     overrides_path = CHROMA_DIR / "rules_overrides.json"
@@ -510,7 +795,7 @@ elif page == "Regras CCT":
             st.success("Sem pendências detectadas ou já cobertas por overrides.")
 
     with colB:
-        st.markdown("**Overrides existentes:**")
+        st.markdown("**Regras manuais - Overrides (importação ou cadastro):**")
         if overrides:
             df_over = pd.DataFrame([
                 {"UF": k.split("::",1)[0], "Sindicato": k.split("::",1)[1], **v}
@@ -521,7 +806,7 @@ elif page == "Regras CCT":
             st.info("Nenhum override salvo ainda.")
 
     st.divider()
-    st.markdown("### Regras importadas (OCR/index)")
+    st.markdown("### 3.2 Regras importadas (OCR/index)")
     st.caption("Lista completa de CCTs importadas do OCR/index, incluindo casos com UF=DESCONHECIDO. Use para verificar presença de RJ/PR.")
     try:
         if rules_index:
@@ -562,7 +847,7 @@ elif page == "Regras CCT":
         st.warning(f"Falha ao exibir regras importadas: {e}")
 
     st.divider()
-    st.markdown("### Importação planilha")
+    st.markdown("### 3.3 Importação planilha")
     st.caption("Envie um CSV/XLSX com colunas ESTADO (ou UF) e VALOR. Usado quando a CCT não definir VR/VA/dias.")
     up_ev = st.file_uploader("Planilha Estado/Valor", type=["csv","xlsx"], key="estado_valor_upload")
     if up_ev is not None:
@@ -577,7 +862,7 @@ elif page == "Regras CCT":
             st.error(f"Falha ao salvar arquivo: {e}")
 
     st.divider()
-    st.markdown("### Cadastro manual")
+    st.markdown("### 3.3 Cadastro manual")
     # Permitir selecionar um override existente para edição rápida
     override_keys = [f"{k.split('::',1)[0]} :: {k.split('::',1)[1]}" for k in sorted(overrides.keys())]
     sel_label = "Selecionar override existente (opcional)"
@@ -633,7 +918,7 @@ elif page == "Regras CCT":
                     st.error(f"Falha ao salvar override: {e}")
 
     st.divider()
-    st.markdown("### Importar Overrides de CSV (opcional)")
+    st.markdown("### 3.4 Importar Overrides de CSV (opcional)")
     st.caption("Colunas esperadas: UF, Sindicato, vr_valor, va_valor, dias, notas")
     up = st.file_uploader("CSV de overrides", type=["csv"], key="overcsv")
     if up is not None:
@@ -660,7 +945,7 @@ elif page == "Regras CCT":
             st.error(f"Falha ao importar CSV: {e}")
 
     st.divider()
-    st.markdown("### Validação de Compliance (OCR x Sistema)")
+    st.markdown("### 3.5 Validação de Compliance (OCR x Sistema)")
     st.caption("Compara regras extraídas por OCR (rules_index.json) com as regras resolvidas pelo sistema (overrides/SQLite/Chroma).")
     if st.button("Executar validação de compliance"):
         try:
@@ -714,7 +999,7 @@ elif page == "Regras CCT":
             st.error(f"Falha na validação de compliance: {e}")
 
     st.divider()
-    st.markdown("### Resumo consolidado (rules_index.json consolidado)")
+    st.markdown("### 3.6 Resumo consolidado (rules_index.json consolidado)")
     st.caption("Consolidação por UF/Sindicato priorizando valores > cláusulas > dias, preferindo periodicidade diária em caso de empate.")
     try:
         from agentes.cct import criar_agente_coletor_cct
@@ -766,7 +1051,7 @@ elif page == "Regras CCT":
         st.warning(f"Falha ao gerar resumo consolidado: {e}")
 
 # Página: Prompts
-elif page == "Prompts":
+elif page == "5-Prompts":
     st.subheader("Prompts dos Agentes")
     prompt_files = sorted(PROMPTS_DIR.glob("*.md"))
     if not prompt_files:
@@ -795,14 +1080,18 @@ elif page == "Prompts":
             )
 
 # Página: Notificações
-elif page == "Notificações":
-    st.subheader("Notificações e Sinalizações")
+elif page == "6-Notificações":
+    st.subheader("6.1 Notificações e Sinalizações")
     st.caption("Diferenças entre valor VR do relatório base (estado) e CCT, matrículas sem admissão, e exclusões por regra.")
 
     from datetime import date as _date
     hoje = _date.today()
     # Calendar popover for competência (use the picked date's year-month)
-    default_comp = _date(hoje.year, hoje.month, 1)
+    _cfg2 = get_competencia() or {}
+    if _cfg2.get("year") and _cfg2.get("month"):
+        default_comp = _date(int(_cfg2["year"]), int(_cfg2["month"]), 1)
+    else:
+        default_comp = _date(hoje.year, hoje.month, 1)
     comp_date = st.date_input("Competência", value=default_comp, format="YYYY-MM-DD", help="Selecione a competência no calendário")
     # Normalize to YYYY-MM
     y, m = comp_date.year, comp_date.month
@@ -996,42 +1285,127 @@ elif page == "Notificações":
         # Atendimentos/OBS: apenas contar linhas se arquivo existir
         qtd_atend = int(len(atend)) if atend is not None and not atend.empty else 0
 
-        # Exibir métricas
-        st.metric("Ativos", value=total_ativos)
-        cA, cB, cC, cD = st.columns(4)
-        with cA:
+        # New metric computation: Admissions-only entries with blank column D
+        try:
+            admissao_so_na_planilha_sem_obs = 0
+            if admis is not None and not admis.empty:
+                # Union of IDs from other bases
+                ids_outros = set()
+                try:
+                    ids_outros |= _ids(ativos)
+                except Exception:
+                    pass
+                try:
+                    ids_outros |= ids_ap
+                    ids_outros |= ids_es
+                    ids_outros |= ids_ex
+                except Exception:
+                    pass
+                try:
+                    ids_outros |= _ids(ferias)
+                except Exception:
+                    pass
+                try:
+                    ids_outros |= _ids(afast)
+                except Exception:
+                    pass
+                try:
+                    ids_outros |= _ids(deslig)
+                except Exception:
+                    pass
+
+                # Determine Admissions IDs and check column D (4th column) blank
+                admis_ids = _ids(admis)
+                if len(admis.columns) >= 4:
+                    col_d = admis.columns[3]
+                    s = admis[col_d].astype(str).str.strip().replace({"nan": "", "None": ""})
+                    ids_colD_blank = set(map(str, admis.loc[s == "", admis.columns[0]].astype(str).tolist()))
+                else:
+                    ids_colD_blank = set()
+
+                only_in_adm = {mid for mid in admis_ids if mid not in ids_outros}
+                target_ids = only_in_adm & ids_colD_blank
+                admissao_so_na_planilha_sem_obs = int(len(target_ids))
+        except Exception:
+            admissao_so_na_planilha_sem_obs = 0
+
+        # Grouped metrics layout
+        st.markdown("#### Funcionários")
+        popA, popB, popC, popD = st.columns(4)
+        with popA:
+            st.metric("Ativos", value=total_ativos)
+        with popB:
             st.metric("Aprendiz", value=qtd_aprendiz)
-        with cB:
+        with popC:
             st.metric("Estagiário", value=qtd_estagio)
-        with cC:
+        with popD:
             st.metric("Exterior", value=qtd_exterior)
-        with cD:
+
+        st.markdown("#### Ocorrências")
+        occA, occB, occC = st.columns(3)
+        with occA:
             st.metric("Férias", value=qtd_ferias)
-        cE, cF, cG = st.columns(3)
-        with cE:
+        with occB:
             st.metric("Afastados/Licenças", value=qtd_afast)
-        with cF:
-            st.metric("Desligados Geral", value=qtd_deslig_geral)
-        with cG:
+        with occC:
+            st.metric("Atendimentos/OBS", value=qtd_atend)
+
+        st.markdown("#### Admissões")
+        admA, admB, admC, admD = st.columns(4)
+        with admA:
             st.metric("Matrículas sem admissão", value=sem_adm)
-        cH, cI = st.columns(2)
-        with cH:
+        with admB:
             st.metric("Admitidos mês", value=qtd_adm_mes)
-        with cI:
+        with admC:
             st.metric("Admitidos mês anterior", value=qtd_adm_mes_prev)
+        with admD:
+            st.metric(
+                "Só na Admissão (col. D vazia)",
+                value=admissao_so_na_planilha_sem_obs,
+                help="Quantidade presente apenas na planilha de admissão e com coluna D (4ª coluna) em branco"
+            )
 
-        cJ, cK, cL = st.columns(3)
-        with cJ:
-            st.metric("Desligados até 15 (OK)", value=qtd_deslig_ate15_ok, help="Excluir da compra")
-        with cK:
-            st.metric("Desligados até 15 (sem OK)", value=qtd_deslig_ate15_sem_ok, help="Comprar integral")
-        with cL:
-            st.metric("Desligados 16..fim", value=qtd_deslig_16a_fim, help="Recarga cheia; desconto proporcional em rescisão")
+        st.markdown("#### Desligamentos")
+        desA, desB, desC, desD = st.columns(4)
+        with desA:
+            st.metric("Desligados Geral", value=qtd_deslig_geral)
+        with desB:
+            st.metric("Até 15 (OK)", value=qtd_deslig_ate15_ok, help="Excluir da compra")
+        with desC:
+            st.metric("Até 15 (sem OK)", value=qtd_deslig_ate15_sem_ok, help="Comprar integral")
+        with desD:
+            st.metric("16..fim", value=qtd_deslig_16a_fim, help="Recarga cheia; desconto proporcional em rescisão")
 
-        st.metric("Atendimentos/OBS", value=qtd_atend)
+        # Compact summary table with download
+        with st.expander("Resumo em tabela", expanded=False):
+            _summary = [
+                {"Métrica": "Ativos", "Valor": total_ativos},
+                {"Métrica": "Aprendiz", "Valor": qtd_aprendiz},
+                {"Métrica": "Estagiário", "Valor": qtd_estagio},
+                {"Métrica": "Exterior", "Valor": qtd_exterior},
+                {"Métrica": "Férias", "Valor": qtd_ferias},
+                {"Métrica": "Afastados/Licenças", "Valor": qtd_afast},
+                {"Métrica": "Atendimentos/OBS", "Valor": qtd_atend},
+                {"Métrica": "Matrículas sem admissão", "Valor": sem_adm},
+                {"Métrica": "Admitidos mês", "Valor": qtd_adm_mes},
+                {"Métrica": "Admitidos mês anterior", "Valor": qtd_adm_mes_prev},
+                {"Métrica": "Só na Admissão (col. D vazia)", "Valor": admissao_so_na_planilha_sem_obs},
+                {"Métrica": "Desligados Geral", "Valor": qtd_deslig_geral},
+                {"Métrica": "Desligados até 15 (OK)", "Valor": qtd_deslig_ate15_ok},
+                {"Métrica": "Desligados até 15 (sem OK)", "Valor": qtd_deslig_ate15_sem_ok},
+                {"Métrica": "Desligados 16..fim", "Valor": qtd_deslig_16a_fim},
+            ]
+            _df_sum = pd.DataFrame(_summary)
+            st.dataframe(_df_sum, use_container_width=True, hide_index=True)
+            st.download_button(
+                "Baixar resumo (CSV)",
+                data=_df_sum.to_csv(index=False).encode("utf-8"),
+                file_name="notificacoes_resumo.csv",
+                mime="text/csv",
+            )
 
         st.divider()
-        st.markdown("### Diferenças de VR — Base (Estado) x CCT")
+        st.markdown("### 5.2 Diferenças de VR — Base (Estado) x CCT")
         # Preparar mapa Estado->valor
         diff_rows = []
         estado_val_map = {}
@@ -1169,171 +1543,81 @@ elif page == "Notificações":
         st.error(f"Falha ao gerar notificações: {e}")
 
 # Página: Dashboard
-elif page == "Dados Finais":
-    st.subheader("Execução e Revisão")
-    tarefastr = st.text_input(
-        "Tarefa", value=(
-            "Calcular VR/VA para o mês de Maio de 2025 usando arquivos em dados_entrada/, validando compliance e CCTs."
-        )
+elif page == "7-Dados Finais":
+    # 7.0 Pipeline & Agentes (visão e artefatos)
+    st.subheader("7.0 Pipeline & Agentes")
+    st.markdown(
+        """
+        - [1] Agente de Dados (Ingest/Qualidade): atua na página "1-Importar Relatórios Base" (validação 1.3) e ao preparar as bases para o cálculo.
+        - [2] Agente CCT (OCR/Index): atua nas páginas "2-Importar CCTs" e "3-Validação de Regras CCT" para extrair e cadastrar regras. No cálculo, quando não há Override, `resolve_cct_rules` consulta OCR/index.
+        - [3] Agente VR/VA Resolver: coordena a resolução de VR/VA (Overrides → OCR/Index → Retrieval) durante o cálculo determinístico.
+        - [4] Agente Compliance: gera verificações e observações (exibidas em artefatos abaixo quando disponíveis).
+        - [5] Cálculo Determinístico: aplica janela de competência, exclusões e proporcionalidades para gerar dias e totais.
+        """
     )
-    if st.button("Executar Orquestração"):
-        status_placeholder = st.empty()
-        status_placeholder.info("Aguardando o início do processo...")
-        # Infra: limpar arquivo de progresso antes de iniciar
-        prog_file = RELATORIOS_DIR / "progresso_execucao.jsonl"
+    with st.expander("Ver artefatos recentes dos agentes (se disponíveis)"):
         try:
-            if prog_file.exists():
-                prog_file.unlink()
+            regras_txt = RELATORIOS_DIR / "regras.txt"
+            if regras_txt.exists():
+                st.markdown("**Regras CCT (resumo do agente):**")
+                st.code(regras_txt.read_text(encoding="utf-8"), language="markdown")
+            else:
+                st.info("Artefato 'regras.txt' não encontrado.")
         except Exception:
-            pass
-        # Placeholders de workflow ao vivo
-        current_placeholder = st.empty()
-        steps_placeholder = st.empty()
-        env = os.environ.copy()
-        env["ORQ_TAREFA"] = tarefastr
-        with st.spinner("Executando orquestração..."):
-            status_placeholder.info("Executando orquestração...")
-            proc = subprocess.Popen(
-                [sys.executable, str(BASE_DIR / "main.py")],
-                cwd=str(BASE_DIR), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1, env=env
-            )
-            # Não exibimos log bruto; apenas status tabular
-            steps = []  # lista de dicts {agent, action, status, info}
-            for line in proc.stdout:
-                ln = line.rstrip()
-                # Captura e exibe workflow se vier marcador ::STEP::
-                if ln.startswith("::STEP::"):
-                    try:
-                        _pfx, agent, action, status, rest = ln.split("::", 4)
-                        info = rest.strip()
-                    except ValueError:
-                        agent = action = status = ""
-                        info = ln
-                    steps.append({
-                        "Agente": agent,
-                        "Ação": action,
-                        "Status": status,
-                        "Info": info,
-                    })
-                    # Atualiza UI
-                    if agent:
-                        current_placeholder.markdown(f"**Agente atual:** {agent}  ")
-                        current_placeholder.markdown(f"Ação: {action} — Status: `{status}`")
-                    if steps:
-                        import pandas as _pd
-                        steps_df = _pd.DataFrame(steps)
-                        steps_placeholder.dataframe(steps_df, use_container_width=True, hide_index=True)
-            proc.wait()
-            status_placeholder.success("Processo concluído.")
-            st.success(f"Orquestração finalizada (exit={proc.returncode}).")
-
-        # Após execução, tenta exibir relatório de validações do orquestrador
+            st.warning("Falha ao carregar 'regras.txt'.")
         try:
-            import json
-            resultado_json = RELATORIOS_DIR / "resultado_execucao.json"
-            if resultado_json.exists():
-                dados = json.loads(resultado_json.read_text(encoding="utf-8"))
-                st.subheader("Checks de Validação da Execução")
-                validacoes = dados.get("validacoes", [])
-                if validacoes:
-                    for v in validacoes:
-                        st.markdown(f"- ✅ {v}")
-                else:
-                    st.info("Nenhuma validação registrada.")
-        except Exception as e:
-            st.warning(f"Não foi possível carregar o relatório de validações: {e}")
-
-        # Histórico de execução (arquivo jsonl)
-        st.divider()
-        st.markdown("### Histórico de Execução (Workflow)")
-        try:
-            if prog_file.exists():
-                rows = []
-                for ln in prog_file.read_text(encoding="utf-8").splitlines():
-                    try:
-                        rows.append(json.loads(ln))
-                    except Exception:
-                        pass
-                if rows:
-                    df_hist = pd.DataFrame(rows)
-                    # Renomeia colunas para PT
-                    df_hist = df_hist.rename(columns={
-                        "agent": "Agente",
-                        "action": "Ação",
-                        "status": "Status",
-                        "info": "Info",
-                    })
-                    st.dataframe(df_hist, use_container_width=True, hide_index=True)
-                else:
-                    st.info("Sem passos registrados no progresso.")
+            compliance_txt = RELATORIOS_DIR / "compliance.txt"
+            if compliance_txt.exists():
+                st.markdown("**Compliance (observações do agente):**")
+                st.code(compliance_txt.read_text(encoding="utf-8"), language="markdown")
             else:
-                st.info("Arquivo de progresso não encontrado.")
-        except Exception as e:
-            st.warning(f"Falha ao carregar histórico: {e}")
+                st.info("Artefato 'compliance.txt' não encontrado.")
+        except Exception:
+            st.info("Banco ainda não criado.")
 
-    # (Seções removidas: Regras (CCT) e Compliance)
-
+    # 7.1 Gerar Benefícios Mensais (unificado)
     st.divider()
-    st.subheader("Banco de Dados (SQLite)")
-    if DB_PATH.exists():
-        st.caption(f"Arquivo: {DB_PATH}")
-        # Botão de smoke test: cria uma tabela simples no DB
-        if st.button("Criar tabela de teste no DB"):
-            try:
-                import sqlite3
-                df_test = pd.DataFrame([
-                    {"Validações": "Smoke", "Check": "OK"},
-                    {"Validações": "Paths", "Check": str(DB_PATH)},
-                ])
-                with sqlite3.connect(str(DB_PATH)) as conn:
-                    df_test.to_sql("smoke_test", conn, if_exists="replace", index=False)
-                st.success("Tabela 'smoke_test' criada com sucesso.")
-            except Exception as e:
-                st.error(f"Falha ao criar tabela de teste: {e}")
-        try:
-            import sqlite3
-            with sqlite3.connect(str(DB_PATH)) as conn:
-                tbls = pd.read_sql_query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;", conn)
-            if tbls.empty:
-                st.info("Nenhuma tabela encontrada no banco ainda.")
-            else:
-                tnames = tbls["name"].tolist()
-                tsel = st.selectbox("Tabela para visualizar", tnames)
-                with sqlite3.connect(str(DB_PATH)) as conn:
-                    df_tbl = pd.read_sql_query(f"SELECT * FROM {tsel} LIMIT 500", conn)
-                st.dataframe(df_tbl, use_container_width=True)
-        except Exception as e:
-            st.error(f"Erro ao ler o banco: {e}")
-    else:
-        st.info("Banco ainda não criado.")
-
-    # (Seção removida: Arquivos gerados)
-
-    st.divider()
-    st.markdown("### Gerar Benefícios Mensais (VR / VA / Consolidado)")
+    st.subheader("7.1 Gerar Benefícios Mensais (VR / VA / Consolidado)")
     from datetime import date as _date
     hoje = _date.today()
     colc, colp, coln = st.columns([1,1,2])
     with colc:
-        competencia = st.text_input("Competência (YYYY-MM)", value=f"{hoje.year}-{hoje.month:02d}")
+        _cfg3 = get_competencia() or {}
+        if _cfg3.get("year") and _cfg3.get("month"):
+            _yy, _mm = int(_cfg3["year"]), int(_cfg3["month"]) 
+        else:
+            _yy, _mm = hoje.year, hoje.month
+        if "compet_input" not in st.session_state:
+            st.session_state["compet_input"] = f"{_yy}-{_mm:02d}"
+        competencia = st.text_input("Competência (YYYY-MM)", key="compet_input")
+        def _apply_global_comp():
+            _cfg4 = get_competencia() or {}
+            if _cfg4.get("year") and _cfg4.get("month"):
+                st.session_state["compet_input"] = f"{int(_cfg4['year'])}-{int(_cfg4['month']):02d}"
+            else:
+                st.session_state["compet_input"] = f"{hoje.year}-{hoje.month:02d}"
+        st.button("Aplicar global", help="Usar competência definida em 0-Mês Competência", on_click=_apply_global_comp)
     with colp:
         produto = st.selectbox("Produto", ["VR", "VA", "CONSOLIDADO"], index=0)
     with coln:
         default_prefix = "VR_MENSAL" if produto=="VR" else ("VA_MENSAL" if produto=="VA" else "BENEFICIOS_MENSAL_CONSOLIDADO")
-        nome_arquivo = st.text_input("Nome do arquivo de exportação", value=f"{default_prefix}_{hoje.month:02d}.{hoje.year}.xlsx")
+        try:
+            _yyi, _mmi = competencia.split("-")
+            _yyi = int(_yyi); _mmi = int(_mmi)
+        except Exception:
+            _yyi, _mmi = _yy, _mm
+        nome_arquivo = st.text_input("Nome do arquivo de exportação", value=f"{default_prefix}_{_mmi:02d}.{_yyi}.xlsx")
     st.markdown("#### Base de valores para VR/VA")
     base_opt = st.radio(
         "Selecione a base a utilizar",
         ["CCT Padrão", "Importação planilha"],
         index=0,
         help="CCT Padrão usa regras resolvidas (inclui cadastro manual/overrides). Importação planilha usa arquivo Estado/Valor em dados_entrada/.")
-    if st.button("Gerar Relatório"):
+    if st.button("Executar e Gerar Relatório"):
         try:
             # Validar seleção e setar modo via variável de ambiente para o cálculo
             mode = "CCT" if base_opt.startswith("CCT") else "MANUAL"
             os.environ["VRVA_VAL_BASE"] = mode
-            # Quando em modo Manual/Estado, validar presença de base ESTADO/VALOR em dados_entrada/
             if mode == "MANUAL":
                 # localizar arquivo e validar colunas
                 base_file = None
@@ -1343,10 +1627,7 @@ elif page == "Dados Finais":
                         break
                 if not base_file:
                     st.error("Modo 'Importação planilha' selecionado, mas nenhuma planilha de Estado/Valor foi encontrada em dados_entrada/.")
-                    st.info("Envie um CSV/XLSX com colunas ESTADO (ou UF) e VALOR na seção 'Importação planilha'.")
-                    up2 = st.file_uploader("Enviar agora (Estado/Valor)", type=["csv","xlsx"], key="estado_valor_upload_run")
                     st.stop()
-                # valida colunas
                 try:
                     if base_file.suffix.lower() == ".csv":
                         df_ev = pd.read_csv(base_file)
@@ -1361,7 +1642,7 @@ elif page == "Dados Finais":
                 except Exception as e:
                     st.error(f"Falha ao ler/validar planilha Estado/Valor: {e}")
                     st.stop()
-            # LangChain Tool expects positional tool_input
+            # Chamada unificada do cálculo determinístico
             res = json.loads(calcular_financeiro_vr.run(f"{competencia}|{produto}"))
             total_fmt = f"R$ {res['total_geral']:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
             st.success(f"Produto: {res.get('produto', produto)} | Linhas: {res['linhas']} | Total: {total_fmt}")
@@ -1373,11 +1654,10 @@ elif page == "Dados Finais":
                     if not desired.lower().endswith(".xlsx"):
                         desired += ".xlsx"
                     custom_path = RELATORIOS_DIR / desired
-                    # copia bytes do arquivo gerado para o nome desejado
                     with open(res["saida_xlsx"], "rb") as src, open(custom_path, "wb") as dst:
                         dst.write(src.read())
                     export_path = custom_path
-            except Exception as _:
+            except Exception:
                 pass
             with open(export_path, "rb") as f:
                 st.download_button(
@@ -1411,3 +1691,185 @@ elif page == "Dados Finais":
                         )
         except Exception as e:
             st.error(f"Falha ao gerar relatório: {e}")
+
+    # 7.2 Banco de Dados (SQLite)
+    st.divider()
+    st.subheader("7.2 Banco de Dados (SQLite)")
+    if DB_PATH.exists():
+        st.caption(f"Arquivo: {DB_PATH}")
+        # Botão de smoke test: cria uma tabela simples no DB
+        if st.button("Criar tabela de teste no DB"):
+            try:
+                import sqlite3
+                df_test = pd.DataFrame([
+                    {"Validações": "Smoke", "Check": "OK"},
+                    {"Validações": "Paths", "Check": str(DB_PATH)},
+                ])
+                with sqlite3.connect(str(DB_PATH)) as conn:
+                    df_test.to_sql("smoke_test", conn, if_exists="replace", index=False)
+                st.success("Tabela 'smoke_test' criada com sucesso.")
+            except Exception as e:
+                st.error(f"Falha ao criar tabela de teste: {e}")
+        try:
+            import sqlite3
+            with sqlite3.connect(str(DB_PATH)) as conn:
+                tbls = pd.read_sql_query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;", conn)
+            if tbls.empty:
+                st.info("Nenhuma tabela encontrada no banco ainda.")
+            else:
+                tnames = tbls["name"].tolist()
+                tsel = st.selectbox("Tabela para visualizar", tnames)
+                with sqlite3.connect(str(DB_PATH)) as conn:
+                    df_tbl = pd.read_sql_query(f"SELECT * FROM {tsel} LIMIT 500", conn)
+                st.dataframe(df_tbl, use_container_width=True)
+        except Exception as e:
+            st.error(f"Erro ao ler o banco: {e}")
+    else:
+        st.info("Banco ainda não criado.")
+
+    # 7.3 Chat com Dados Importados (tabelas)
+    st.divider()
+    st.subheader("7.3 Chat com Dados Importados (tabelas)")
+    st.caption("Converse com o conteúdo dos arquivos em dados_entrada/ (CSV/XLSX). Um índice FAISS é criado em base_conhecimento/faiss_tabelas.")
+
+    def _build_or_load_faiss_tables(force: bool=False):
+        FAISS_TABELAS_DIR.mkdir(parents=True, exist_ok=True)
+        emb = None
+        try:
+            # Reaproveita a mesma estratégia local de embeddings (força CPU)
+            emb = HuggingFaceEmbeddings(
+                model_name=str((MODELS_DIR / os.getenv("HUGGINGFACE_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")).resolve()),
+                model_kwargs={"device": "cpu"}
+            )
+        except Exception as e:
+            st.error(f"Falha ao carregar embeddings locais: {e}")
+            st.stop()
+        index_path = FAISS_TABELAS_DIR / "index"
+        # Detectar mudanças no conjunto de arquivos e forçar rebuild quando necessário
+        current_files = sorted([p.name for p in DADOS_DIR.glob("*.*") if p.suffix.lower() in (".csv", ".xlsx")])
+        if not force and index_path.exists():
+            if st.session_state.get('tabelas_index_files') != current_files:
+                force = True
+            try:
+                return FAISS.load_local(str(index_path), embeddings=emb, allow_dangerous_deserialization=True)
+            except Exception:
+                pass
+        # Construir a partir de dados_entrada/
+        docs_all = []
+        splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200) if RecursiveCharacterTextSplitter else None
+        for f in sorted(DADOS_DIR.glob("*.*")):
+            suff = f.suffix.lower()
+            if suff not in (".csv", ".xlsx"):
+                continue
+            try:
+                if suff == ".csv":
+                    # Ler como texto para preservar zeros à esquerda e formatos
+                    df_map = {"__DEFAULT__": pd.read_csv(f, dtype=str)}
+                else:
+                    # Ler TODAS as abas da planilha
+                    df_map = pd.read_excel(f, sheet_name=None, engine="openpyxl", dtype=str)
+            except Exception as e:
+                st.warning(f"Falha ao ler {f.name}: {e}")
+                continue
+            # converter cada linha em texto auditável (por aba)
+            for sheet_name, df_ in df_map.items():
+                if df_ is None:
+                    continue
+                # Normalizar colunas
+                try:
+                    df_ = df_.fillna("")
+                except Exception:
+                    pass
+                for idx, row in df_.iterrows():
+                    try:
+                        parts = []
+                        for c in df_.columns:
+                            val = row.get(c)
+                            if val is None or (isinstance(val, float) and pd.isna(val)):
+                                continue
+                            sval = str(val).strip()
+                            if not sval:
+                                continue
+                            parts.append(f"{c}: {sval}")
+                        text = f"Fonte: {f.name}{'' if sheet_name=='__DEFAULT__' else f'#{sheet_name}'} | Linha: {idx}\n" + "\n".join(parts)
+                        if not parts:
+                            continue
+                        # dividir se necessário
+                        if splitter:
+                            chunks = splitter.split_text(text)
+                            for j, ch in enumerate(chunks):
+                                docs_all.append({"page_content": ch, "metadata": {"source": f"{f.name}{'' if sheet_name=='__DEFAULT__' else f'#{sheet_name}'}", "row": idx, "chunk": j}})
+                        else:
+                            docs_all.append({"page_content": text, "metadata": {"source": f"{f.name}{'' if sheet_name=='__DEFAULT__' else f'#{sheet_name}'}", "row": idx}})
+                    except Exception:
+                        continue
+        if not docs_all:
+            st.info("Nenhum CSV/XLSX válido em dados_entrada/.")
+            st.stop()
+        # Converter dicts em Document-like para FAISS
+        from types import SimpleNamespace
+        docs_lang = [SimpleNamespace(page_content=d["page_content"], metadata=d["metadata"]) for d in docs_all]
+        vs = FAISS.from_documents(docs_lang, embedding=emb)
+        vs.save_local(str(index_path))
+        # Persistir arquivos indexados na sessão para detectar mudanças
+        st.session_state['tabelas_index_files'] = current_files
+        return vs
+
+    c1, c2 = st.columns([1,1])
+    with c1:
+        if st.button("Indexar/Atualizar Dados Importados"):
+            try:
+                _build_or_load_faiss_tables(force=True)
+                st.success("Índice de dados recriado/atualizado.")
+            except Exception as e:
+                st.error(f"Falha ao indexar dados: {e}")
+    with c2:
+        files = [p.name for p in DADOS_DIR.glob("*.*") if p.suffix.lower() in (".csv", ".xlsx")]
+        st.write("Arquivos detectados:", files or "(vazio)")
+
+    try:
+        vs_tbl = _build_or_load_faiss_tables(force=False)
+        retriever_tbl = vs_tbl.as_retriever(search_kwargs={"k": 12})
+    except Exception as e:
+        st.error(f"Falha ao carregar índice de dados: {e}")
+        retriever_tbl = None
+
+    if retriever_tbl is not None:
+        # Histórico acima do input (ordem decrescente)
+        st.markdown("**Histórico**")
+        d_hist = st.session_state.setdefault('data_chat_history', [])
+        if d_hist:
+            for item in d_hist:
+                st.markdown(f"- Pergunta: {item.get('q','')}")
+                st.markdown(f"- Resposta: {item.get('a','')}")
+                srcs = item.get('srcs') or []
+                if srcs:
+                    st.caption("Fontes: " + ", ".join(srcs))
+            st.divider()
+
+        with st.form("dados_chat_form"):
+            q = st.text_input("Pergunte algo sobre os dados importados (ex.: quantos desligados com OK até dia 15?)", value="")
+            sb = st.form_submit_button("Perguntar")
+        if sb and q.strip():
+            try:
+                docs = retriever_tbl.get_relevant_documents(q)
+                contexto = "\n\n".join([d.page_content for d in docs])
+                fontes = sorted({(d.metadata or {}).get("source", "?") for d in docs})
+                llm = get_llm()
+                _tmpl_dados = carregar_prompt("chat_dados")
+                prompt = _tmpl_dados.format(
+                    context=contexto,
+                    chat_history=_format_history_for_prompt(d_hist),
+                    question=q,
+                )
+                if HumanMessage:
+                    resp = llm.invoke([HumanMessage(content=prompt)])
+                    answer = getattr(resp, "content", str(resp))
+                else:
+                    answer = str(llm.invoke(prompt))
+                # Prepend no histórico
+                d_hist.insert(0, {"q": q, "a": answer, "srcs": list(fontes)})
+                st.session_state['data_chat_history'] = d_hist
+                st.experimental_rerun()
+            except Exception as e:
+                st.error(f"Falha ao responder: {e}")

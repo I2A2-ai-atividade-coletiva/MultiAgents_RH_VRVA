@@ -6,8 +6,9 @@ from agentes.analista_cct import criar_agente_cct
 from agentes.especialista_compliance import criar_agente_compliance
 from agentes.coletor_cct import criar_agente_coletor_cct
 from agentes.especialista_calculo import criar_agente_calculo
+from agentes.especialista_vrva import criar_agente_vrva
 from ferramentas.gerador_relatorio import salvar_planilha_final
-from ferramentas.calculadora_beneficios import executar_calculo_deterministico
+from ferramentas.calculadora_beneficios import executar_calculo_deterministico, _find_col, _find_file_by_keywords
 from datetime import date as _date
 import pandas as pd
 import json
@@ -26,6 +27,7 @@ def criar_agente_orquestrador() -> Callable[[str], str]:
     # Instancia especialistas (versões simples com LLM já integrados)
     agente_dados = criar_agente_dados()
     agente_coletor_cct = criar_agente_coletor_cct()
+    agente_vrva = criar_agente_vrva()
     agente_compliance = criar_agente_compliance()
     agente_calculo = criar_agente_calculo()
 
@@ -58,7 +60,7 @@ def criar_agente_orquestrador() -> Callable[[str], str]:
             print(f"::STEP::{agent}::{action}::{status}:: {info or ''}")
         cabecalho = [
             "[Orquestrador] Tarefa recebida.",
-            "Sequência: Dados -> Coletor CCT -> CCT -> Compliance -> Cálculo.",
+            "Sequência: Dados -> Coletor CCT -> VR/VA -> CCT -> Compliance -> Cálculo.",
         ]
         # Coleta de validações para exibição no Dashboard
         validacoes_execucao: list[str] = []
@@ -145,6 +147,28 @@ def criar_agente_orquestrador() -> Callable[[str], str]:
         except Exception:
             pass
 
+        # Especialista VR/VA: consolidação e resolução de conflitos após ingestão Docling
+        emit_progress("Especialista VR/VA", "Resolver VR/VA por UF/Sindicato", "START")
+        write_status("Agente em ação: Especialista VR/VA - Resolução de VR/VA")
+        try:
+            instr_vrva = "Consolide e resolva VR/VA com regras e confiança. Retorne apenas um array JSON."
+            saida_vrva = agente_vrva(instr_vrva)
+            emit_progress("Especialista VR/VA", "Resolver VR/VA por UF/Sindicato", "DONE")
+            write_status("Especialista VR/VA - Concluído")
+            validacoes_execucao.append("VR/VA resolvidos por UF/Sindicato")
+            # Persistência tentativa: regras_cct_vrva_resolvidas_json (para Dashboard)
+            try:
+                arr = _primeiro_json_array(saida_vrva)
+                if arr is not None:
+                    dfjson = json.dumps(arr, ensure_ascii=False)
+                    salvar_dataframe_db(dfjson, "regras_cct_vrva_resolvidas_json")
+            except Exception:
+                pass
+        except Exception as e:
+            saida_vrva = f"[Erro VR/VA] {e}"
+            emit_progress("Especialista VR/VA", "Resolver VR/VA por UF/Sindicato", "ERROR", str(e))
+            write_status(f"Especialista VR/VA - ERRO: {e}")
+
         emit_progress("Analista de CCT", "Consulta às CCTs", "START")
         write_status("Agente em ação: Analista de CCT - Consulta às CCTs")
         print("Iniciando o trabalho do Analista de CCT...")
@@ -195,54 +219,6 @@ def criar_agente_orquestrador() -> Callable[[str], str]:
         )
         emit_progress("Especialista em Cálculo", "Cálculo de VR/VA", "START")
         write_status("Agente em ação: Especialista em Cálculo - Cálculo de VR/VA")
-        print("Iniciando o trabalho do Especialista em Cálculo...")
-        try:
-            saida_calculo = agente_calculo(instr_calculo)
-        except Exception as e:
-            saida_calculo = f"[Erro Cálculo] {e}"
-            emit_progress("Especialista em Cálculo", "Cálculo de VR/VA", "ERROR", str(e))
-            write_status(f"Especialista em Cálculo - ERRO: {e}")
-        else:
-            validacoes_execucao.append("Cálculo concluído")
-            emit_progress("Especialista em Cálculo", "Cálculo de VR/VA", "DONE")
-            write_status("Especialista em Cálculo - Concluído")
-        # Persistência tentativa: dados_calculo_final
-        try:
-            arr = _primeiro_json_array(saida_calculo)
-            if arr is not None:
-                dfjson = json.dumps(arr, ensure_ascii=False)
-                salvar_dataframe_db.invoke({
-                    "df_json": dfjson,
-                    "nome_tabela": "dados_calculo_final",
-                })
-        except Exception:
-            pass
-
-        pkg_root = Path(__file__).resolve().parent.parent  # automacao_rh_agentes
-        relatorios_dir = pkg_root / "relatorios_saida"
-        partes = [
-            "\n".join(cabecalho),
-            f"[Paths] DB_PATH: {DB_PATH}",
-            f"[Paths] RELATORIOS_DIR: {relatorios_dir}",
-            "\n--- Dados ---\n" + str(saida_dados),
-            "\n--- CCT ---\n" + str(saida_cct),
-            "\n--- Compliance ---\n" + str(saida_compliance),
-            "\n--- Cálculo ---\n" + str(saida_calculo),
-        ]
-
-        # Persiste resumos úteis para o Dashboard (regras e compliance)
-        try:
-            pkg_root = Path(__file__).resolve().parent.parent  # automacao_rh_agentes
-            outdir = pkg_root / "relatorios_saida"
-            outdir.mkdir(parents=True, exist_ok=True)
-            (outdir / "regras.txt").write_text(str(saida_cct), encoding="utf-8")
-            (outdir / "compliance.txt").write_text(str(saida_compliance), encoding="utf-8")
-        except Exception:
-            pass
-
-        # Etapa determinística: cálculo de dias/valores com feriados, férias, desligamentos e 80/20
-        emit_progress("Cálculo Determinístico", "Processar base e aplicar regras", "START")
-        write_status("Agente em ação: Cálculo Determinístico - Processar base e aplicar regras")
         df_base_json = None
         try:
             # prioridade de base: compliance_ok -> consolidado_norm -> consolidado
@@ -286,6 +262,118 @@ def criar_agente_orquestrador() -> Callable[[str], str]:
                 emit_progress("Cálculo Determinístico", "Linhas de entrada", "INFO", f"{len(_inp)}")
             except Exception:
                 pass
+            # Enriquecimento pré-cálculo: incluir "somente Admissões (coluna D vazia)" como ativos
+            try:
+                base_dir = Path(__file__).resolve().parent.parent
+                dados_dir = base_dir / "dados_entrada"
+                # localizar arquivos relevantes
+                f_ativos   = _find_file_by_keywords(str(dados_dir), ["ativos"]) 
+                f_aprendiz = _find_file_by_keywords(str(dados_dir), ["aprend"]) 
+                f_estagio  = _find_file_by_keywords(str(dados_dir), ["estag"]) 
+                f_exterior = _find_file_by_keywords(str(dados_dir), ["exterior"]) 
+                f_ferias   = _find_file_by_keywords(str(dados_dir), ["ferias"]) 
+                f_afast    = _find_file_by_keywords(str(dados_dir), ["afast"]) 
+                f_deslig   = _find_file_by_keywords(str(dados_dir), ["deslig"]) 
+                f_adm      = _find_file_by_keywords(str(dados_dir), ["admiss"]) 
+
+                def _read_any(p: str) -> pd.DataFrame:
+                    if not p:
+                        return pd.DataFrame()
+                    suf = Path(p).suffix.lower()
+                    if suf == ".csv":
+                        return pd.read_csv(p)
+                    elif suf in (".xlsx",):
+                        return pd.read_excel(p, engine="openpyxl")
+                    elif suf == ".xls":
+                        raise ValueError("Formato .xls não suportado; converta para .xlsx.")
+                    else:
+                        return pd.read_excel(p, engine="openpyxl")
+
+                ativos   = _read_any(f_ativos)
+                aprendiz = _read_any(f_aprendiz)
+                estagio  = _read_any(f_estagio)
+                exterior = _read_any(f_exterior)
+                ferias   = _read_any(f_ferias)
+                afast    = _read_any(f_afast)
+                deslig   = _read_any(f_deslig)
+                admis    = _read_any(f_adm)
+
+                def _ids(df: pd.DataFrame) -> set[str]:
+                    try:
+                        if df is None or df.empty:
+                            return set()
+                        return set(map(str, df[df.columns[0]].astype(str).tolist()))
+                    except Exception:
+                        return set()
+
+                ids_outros = set()
+                for _df in (ativos, aprendiz, estagio, exterior, ferias, afast, deslig):
+                    ids_outros |= _ids(_df)
+
+                to_add: list[dict] = []
+                if admis is not None and not admis.empty and len(admis.columns) >= 4:
+                    id_adm_col = admis.columns[0]
+                    col_d = admis.columns[3]  # quarta coluna (coluna D)
+                    try:
+                        s = admis[col_d].astype(str).str.strip().replace({"nan": "", "None": ""})
+                    except Exception:
+                        s = pd.Series(["" for _ in range(len(admis))])
+                    ids_colD_blank = set(map(str, admis.loc[s == "", id_adm_col].astype(str).tolist()))
+                    ids_adm = set(map(str, admis[id_adm_col].astype(str).tolist()))
+                    only_in_adm = {mid for mid in ids_adm if mid not in ids_outros}
+                    target_ids = sorted(list(only_in_adm & ids_colD_blank))
+                    if target_ids:
+                        nome_adm_col = _find_col(admis.columns, ["nome","colaborador","funcionario"]) 
+                        sind_adm_col = _find_col(admis.columns, ["sindicato","sind"]) 
+                        uf_adm_col   = _find_col(admis.columns, ["uf","estado","unidade_federativa"]) 
+                        # mapa Estado->UF
+                        from ferramentas.calculadora_beneficios import UF_MAP as _UF_MAP
+                        rev_map = {v.lower(): k for k, v in _UF_MAP.items()}
+                        for mid in target_ids:
+                            rec = {"matricula": mid, "origem_base": "admiss"}
+                            try:
+                                if nome_adm_col:
+                                    rec["nome"] = admis.loc[admis[id_adm_col].astype(str) == mid, nome_adm_col].iloc[0]
+                            except Exception:
+                                pass
+                            try:
+                                if sind_adm_col:
+                                    rec["sindicato"] = admis.loc[admis[id_adm_col].astype(str) == mid, sind_adm_col].iloc[0]
+                            except Exception:
+                                pass
+                            try:
+                                if uf_adm_col:
+                                    raw = str(admis.loc[admis[id_adm_col].astype(str) == mid, uf_adm_col].iloc[0])
+                                    raw_u = raw.strip().upper()
+                                    if len(raw_u) == 2:
+                                        rec["UF"] = raw_u
+                                    else:
+                                        rec["UF"] = rev_map.get(raw.strip().lower())
+                            except Exception:
+                                pass
+                            to_add.append(rec)
+
+                # anexar ao df_base_json evitando duplicatas
+                try:
+                    base_df = pd.read_json(df_base_json or "[]", orient="records")
+                except Exception:
+                    base_df = pd.DataFrame()
+                if to_add:
+                    add_df = pd.DataFrame(to_add)
+                    # evitar duplicidades: mantém quem já existe
+                    if "matricula" in base_df.columns:
+                        add_df = add_df[~add_df["matricula"].astype(str).isin(base_df["matricula"].astype(str))]
+                    # alinhar colunas
+                    for c in add_df.columns:
+                        if c not in base_df.columns:
+                            base_df[c] = None
+                    base_df = pd.concat([base_df, add_df[base_df.columns]], ignore_index=True)
+                    df_base_json = base_df.to_json(orient="records", force_ascii=False)
+                    emit_progress("Cálculo Determinístico", "Inclusão ADM-only", "INFO", f"Linhas adicionadas: {len(add_df)}")
+            except Exception as _e:
+                # não impede o cálculo
+                emit_progress("Cálculo Determinístico", "Inclusão ADM-only", "SKIP", str(_e))
+
             df_calc_json, validacoes_json = executar_calculo_deterministico(df_base_json, mes_ref)
             # log quantidade de linhas de saída
             try:
